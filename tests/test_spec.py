@@ -325,6 +325,26 @@ def test_non_json_safe_item_values_rejected():
         ExperimentSpec.model_validate(data)
 
 
+def test_inline_item_with_lone_surrogate_rejected():
+    # json.dumps with the default ensure_ascii=True accepts lone surrogates, but
+    # canonical_json (ensure_ascii=False + utf-8 encode) raises on them at
+    # create_run time; the validator's probe must match canonical_json semantics.
+    data = spec_dict()
+    data["dataset"]["items"][0]["input"] = "bad \ud800 value"
+    with pytest.raises(ValidationError, match="JSON-serializable"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_jsonl_item_with_lone_surrogate_rejected_with_location(tmp_path):
+    # JSONL lines come from json.loads, which accepts "\ud800" escapes — the same
+    # probe must run on the path dataset, with the file:line error convention.
+    path = tmp_path / "items.jsonl"
+    path.write_text('{"id": "q1", "input": "bad \\ud800 value"}\n', encoding="utf-8")
+    spec = ExperimentSpec.model_validate(spec_dict(dataset={"path": "items.jsonl"}))
+    with pytest.raises(ValueError, match=r"items\.jsonl:1"):
+        load_items(spec, tmp_path)
+
+
 @pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
 def test_non_finite_temperatures_rejected(bad):
     data = spec_dict()

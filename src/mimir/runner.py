@@ -17,15 +17,36 @@ from pathlib import Path
 from typing import Any
 
 from mimir.cache import build_payload, cache_key, canonical_json
-from mimir.clients.base import Client, ClientError, CompletionRequest
+from mimir.clients.base import Client, ClientError, CompletionRequest, CompletionResponse
 from mimir.spec import ExperimentSpec, load_items
 from mimir.store import Store
 
 _MAX_ATTEMPTS = 5
 _BASE_DELAY_S = 1.0
 _MAX_DELAY_S = 60.0
+_SQLITE_INT_MAX = 2**63 - 1
 
 _sleep = asyncio.sleep
+
+
+def _sanitized_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Apply the store's lone-surrogate replacement up front (json.loads accepts
+    "\\ud800" escapes from provider payloads) so the in-memory envelope is identical
+    to what a later cache hit returns — judge prompts and their cache keys must not
+    differ between a first run and a re-run."""
+    text = json.dumps(envelope, ensure_ascii=False)
+    return json.loads(text.encode("utf-8", "replace").decode("utf-8"))
+
+
+def _validated_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Type-check an envelope (cache rows can be corrupted out of band) and bound the
+    token counts, which SQLite INTEGER columns cannot hold beyond 64 bits — both
+    failure modes must land in the unit error-row path, not abort the TaskGroup."""
+    checked = CompletionResponse.model_validate(envelope).model_dump()
+    for field in ("input_tokens", "output_tokens"):
+        if abs(checked[field]) > _SQLITE_INT_MAX:
+            raise ValueError(f"envelope {field} out of SQLite integer range: {checked[field]}")
+    return checked
 
 
 def parse_pairwise_verdict(text: str) -> str:
@@ -168,7 +189,7 @@ async def _execute_run(
         """Cache-first envelope fetch; a hit never touches the client."""
         envelope = store.cache_get(key)
         if envelope is not None:
-            return envelope, True
+            return _validated_envelope(envelope), True
         request = CompletionRequest(
             model=payload["model"],
             system=payload["system"],
@@ -179,7 +200,8 @@ async def _execute_run(
             sample_index=payload["sample_index"],
         )
         response = await _call_with_retry(client, request, semaphore, bucket)
-        envelope = response.model_dump()
+        # Validate BEFORE cache_put: a garbage envelope must not poison the cache.
+        envelope = _validated_envelope(_sanitized_envelope(response.model_dump()))
         store.cache_put(key, envelope)
         return envelope, False
 

@@ -5,12 +5,14 @@ cache hits skip client calls, and a re-run with one changed variant executes
 only the delta.
 """
 
+import asyncio
 import json
 
 import pytest
 
 import mimir.runner as runner_mod
 from mimir.cache import build_payload, cache_key
+from mimir.clients.base import CompletionResponse
 from mimir.clients.mock import MockClient
 from mimir.runner import (
     TokenBucket,
@@ -37,6 +39,7 @@ def make_spec(
     n_samples=1,
     judge=None,
     limits=None,
+    sampling=None,
 ):
     data = {
         "name": name,
@@ -60,7 +63,7 @@ def make_spec(
                 {"id": "q2", "input": "Why is grass green?"},
             ]
         },
-        "sampling": {"model": "claude-haiku-4-5-20251001"},
+        "sampling": sampling or {"model": "claude-haiku-4-5-20251001"},
         "n_samples": n_samples,
         "limits": limits or {"concurrency": 4, "requests_per_minute": 100_000},
     }
@@ -123,6 +126,24 @@ class FakeClock:
 
     def advance(self, seconds):
         self.t += seconds
+
+
+@pytest.mark.anyio
+async def test_token_bucket_default_capacity_allows_full_first_minute_burst():
+    # DESIGN §5: capacity defaults to the rpm (full first-minute burst).
+    clock = FakeClock()
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock.advance(seconds)
+
+    bucket = TokenBucket(120, clock=clock.now, sleep=fake_sleep)  # capacity omitted
+    for _ in range(120):
+        await bucket.acquire()
+    assert sleeps == []  # the whole first minute's budget is available up front
+    await bucket.acquire()  # the 121st must wait for refill
+    assert sleeps
 
 
 @pytest.mark.anyio
@@ -325,10 +346,12 @@ async def test_exhausted_retries_record_error_row_and_fail_run(store, monkeypatc
         items=[{"id": "q1", "input": "only one"}],
     )
     client = MockClient()
-    client.queue_error(429, times=runner_mod._MAX_ATTEMPTS)
+    # Literal 5, not runner_mod._MAX_ATTEMPTS: the FINAL retry budget (DESIGN §5)
+    # must be pinned externally — a self-referential assertion passes for any value.
+    client.queue_error(429, times=5)
     run_id = await run_experiment(spec, store, client)
 
-    assert len(client.calls) == runner_mod._MAX_ATTEMPTS
+    assert len(client.calls) == 5
     assert store.get_run(run_id)["status"] == "failed"
     (row,) = store.get_samples(run_id)
     assert row["error"] is not None
@@ -565,6 +588,117 @@ async def test_runner_acquires_one_token_per_request_attempt(store, monkeypatch)
 
 
 @pytest.mark.anyio
+async def test_every_retry_attempt_acquires_a_token(store, monkeypatch):
+    # With retries in play, attempts exceed units: acquisition must be per ATTEMPT.
+    # (The zero-retry test above cannot distinguish per-attempt from per-unit.)
+    monkeypatch.setattr(runner_mod, "_BASE_DELAY_S", 0.001)
+    monkeypatch.setattr(runner_mod, "_MAX_DELAY_S", 0.002)
+    acquires = 0
+
+    class CountingBucket(TokenBucket):
+        async def acquire(self):
+            nonlocal acquires
+            acquires += 1
+            await super().acquire()
+
+    monkeypatch.setattr(runner_mod, "TokenBucket", CountingBucket)
+    client = MockClient()
+    client.queue_error(429, times=2)
+    await run_experiment(make_spec(), store, client)
+    assert len(client.calls) == 6  # 4 units + 2 retried attempts
+    assert acquires == 6
+
+
+@pytest.mark.anyio
+async def test_token_bucket_constructed_from_spec_rpm(store, monkeypatch):
+    rates = []
+
+    class RecordingBucket(TokenBucket):
+        def __init__(self, rate_per_minute, *args, **kwargs):
+            rates.append(rate_per_minute)
+            super().__init__(rate_per_minute, *args, **kwargs)
+
+    monkeypatch.setattr(runner_mod, "TokenBucket", RecordingBucket)
+    spec = make_spec(limits={"concurrency": 4, "requests_per_minute": 55_123})
+    await run_experiment(spec, store, MockClient())
+    assert rates == [55_123]
+
+
+@pytest.mark.anyio
+async def test_semaphore_released_during_backoff(store, monkeypatch):
+    # DESIGN §5 FINAL: a retrying unit must not hold a concurrency slot while it
+    # sleeps. With concurrency=1, the backoff below only ends once the OTHER unit's
+    # call has completed — impossible if the slot were held through the backoff.
+    other_call_completed = asyncio.Event()
+
+    async def blocking_backoff(delay):
+        await asyncio.wait_for(other_call_completed.wait(), timeout=2.0)
+
+    monkeypatch.setattr(runner_mod, "_sleep", blocking_backoff)
+
+    class SignalingClient(MockClient):
+        async def complete(self, request):
+            response = await super().complete(request)
+            other_call_completed.set()
+            return response
+
+    client = SignalingClient()
+    client.queue_error(429)  # whichever unit runs first backs off once
+    spec = make_spec(
+        variants=[{"name": "control", "system": "s", "user_template": "Answer: {input}"}],
+        limits={"concurrency": 1, "requests_per_minute": 100_000},
+    )
+    run_id = await asyncio.wait_for(run_experiment(spec, store, client), timeout=5.0)
+    assert store.get_run(run_id)["status"] == "complete"
+    assert all(row["error"] is None for row in store.get_samples(run_id))
+
+
+@pytest.mark.anyio
+async def test_sampling_block_is_wired_into_requests_and_cache_key(store):
+    # Every runner test elsewhere uses spec-default sampling, so hardcoded defaults
+    # would be invisible: this test pins the spec -> request -> cache-key wiring
+    # with fully non-default values, for both sample and judge calls.
+    spec = make_spec(
+        sampling={
+            "model": "claude-haiku-4-5-20251001",
+            "temperature": 0.3,
+            "max_tokens": 99,
+            "seed": 7,
+        },
+        judge={"model": "judge-model", "mode": "rubric"},
+    )
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "8")
+    run_id = await run_experiment(spec, store, client)
+
+    sample_requests = [r for r in client.calls if r.model != "judge-model"]
+    assert sample_requests
+    assert all((r.temperature, r.max_tokens, r.seed) == (0.3, 99, 7) for r in sample_requests)
+    judge_requests = [r for r in client.calls if r.model == "judge-model"]
+    assert judge_requests
+    # Judge calls use judge defaults for temperature/max_tokens but the spec's seed.
+    assert all((r.temperature, r.max_tokens, r.seed) == (0.0, 512, 7) for r in judge_requests)
+    expected_key = cache_key(
+        build_payload(
+            model="claude-haiku-4-5-20251001",
+            system="You are a helpful assistant.",
+            user="Answer: Why is the sky blue?",
+            temperature=0.3,
+            max_tokens=99,
+            seed=7,
+            sample_index=0,
+        )
+    )
+    names = condition_names(store, run_id)
+    (row,) = [
+        r
+        for r in store.get_samples(run_id)
+        if names[r["condition_id"]] == "control" and r["item_id"] == "q1"
+    ]
+    assert row["cache_key"] == expected_key
+
+
+@pytest.mark.anyio
 async def test_judge_client_error_records_judgment_error_row(store):
     client = MockClient()
     await run_experiment(make_spec(), store, client)  # warm the completion cache
@@ -627,7 +761,99 @@ async def test_corrupted_cache_envelope_records_error_row_not_crash(store):
     assert client.calls == []  # the (corrupted) cache hit still skipped the client
     assert store.get_run(run_id)["status"] == "failed"
     (row,) = store.get_samples(run_id)
-    assert "KeyError" in row["error"]
+    assert "ValidationError" in row["error"]  # fetch validates cached envelopes
+
+
+@pytest.mark.anyio
+async def test_wrong_typed_cache_envelope_records_error_row_not_crash(store):
+    # Valid JSON with wrong-typed fields (out-of-band cache corruption) must land in
+    # the same error-row path as missing keys — never abort the TaskGroup.
+    spec = make_spec(
+        variants=[{"name": "control", "system": "s", "user_template": "Answer: {input}"}],
+        items=[{"id": "q1", "input": "only one"}],
+    )
+    payload = build_payload(
+        model="claude-haiku-4-5-20251001",
+        system="s",
+        user="Answer: only one",
+        temperature=1.0,
+        max_tokens=1024,
+        seed=0,
+        sample_index=0,
+    )
+    corrupted = {
+        "text": 123,  # non-string
+        "raw": {},
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "latency_ms": 1.0,
+        "model": "m",
+    }
+    store.cache_put(cache_key(payload), corrupted)
+    client = MockClient()
+    run_id = await run_experiment(spec, store, client)
+
+    assert client.calls == []
+    assert store.get_run(run_id)["status"] == "failed"
+    (row,) = store.get_samples(run_id)
+    assert row["error"] is not None
+
+
+@pytest.mark.anyio
+async def test_provider_lone_surrogate_text_sanitized_before_judging(store):
+    # json.loads accepts lone-surrogate escapes from provider payloads. The store
+    # sanitizes them at persistence; the runner must apply the SAME sanitization to
+    # the in-memory envelope, or the judge prompt (and its cache key) differs between
+    # a first run and a cached re-run — and cache_key raises on the raw surrogate.
+    def judged(client):
+        client.add_rule(lambda request: request.model == "judge-model", "A")
+        client.add_rule(
+            lambda request: request.system == "You are a helpful assistant.",
+            "pre\ud800post",
+        )
+        return client
+
+    client = judged(MockClient())
+    spec = make_spec(judge={"model": "judge-model", "mode": "pairwise"})
+    run_id = await run_experiment(spec, store, client)
+
+    assert store.get_run(run_id)["status"] == "complete"
+    judge_calls = [request for request in client.calls if request.model == "judge-model"]
+    assert judge_calls  # the judge actually ran on the first run
+    assert all("pre?post" in request.user for request in judge_calls)
+
+    # In-memory text == persisted text: an identical re-run is fully cache-served.
+    client.calls.clear()
+    rerun_id = await run_experiment(spec, store, client)
+    assert client.calls == []
+    assert store.get_run(rerun_id)["status"] == "complete"
+
+
+class HugeTokenClient:
+    async def complete(self, request):
+        return CompletionResponse(
+            text="ok",
+            raw={},
+            input_tokens=10**20,  # json.loads/pydantic pass unbounded ints through
+            output_tokens=1,
+            latency_ms=1.0,
+            model=request.model,
+        )
+
+
+@pytest.mark.anyio
+async def test_out_of_range_token_counts_recorded_as_error_rows_not_crash(store):
+    # SQLite INTEGER is 64-bit: a provider emitting a larger token count must become
+    # an error row under the record-never-raise policy, not an OverflowError that
+    # aborts the TaskGroup — and the garbage envelope must not poison the cache.
+    run_id = await run_experiment(make_spec(), store, HugeTokenClient())
+
+    assert store.get_run(run_id)["status"] == "failed"
+    rows = store.get_samples(run_id)
+    assert len(rows) == 4  # every unit still writes its row
+    assert all(row["error"] is not None and "input_tokens" in row["error"] for row in rows)
+    run_id_2 = await run_experiment(make_spec(), store, HugeTokenClient())  # deterministic
+    assert store.get_run(run_id_2)["status"] == "failed"
 
 
 @pytest.mark.anyio
@@ -644,3 +870,38 @@ async def test_judge_skips_pairs_with_failed_samples(store):
     errored = [row for row in store.get_samples(run_id) if row["error"] is not None]
     assert len(errored) == 1
     assert store.get_judgments(run_id) == []  # incomplete pair is skipped, not crashed
+
+
+@pytest.mark.anyio
+async def test_rubric_judge_skips_failed_samples(store):
+    # The rubric analog of the pairwise skip test: only successful samples are
+    # judged; a failed sample must be skipped, not crash judge-task creation.
+    client = MockClient()
+    client.queue_error(400)  # first completion call fails, non-retryable
+    client.add_rule(lambda request: request.model == "judge-model", "8")
+    spec = make_spec(judge={"model": "judge-model", "mode": "rubric"})
+    run_id = await run_experiment(spec, store, client)
+
+    assert store.get_run(run_id)["status"] == "failed"
+    ok_sample_ids = {row["id"] for row in store.get_samples(run_id) if row["error"] is None}
+    assert len(ok_sample_ids) == 3  # 4 units - 1 failed
+    judgments = store.get_judgments(run_id)
+    assert len(judgments) == 3
+    assert {j["sample_a_id"] for j in judgments} == ok_sample_ids
+
+
+@pytest.mark.anyio
+async def test_provider_braces_render_literally_in_judge_prompts(store):
+    # Provider text is a format VALUE, never a template: braces must survive
+    # verbatim into the judge prompt (the trust boundary M4/M5 will reuse).
+    hostile = "{response_b} {0} {input.__class__} {missing}"
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "A")
+    client.add_rule(lambda request: request.system == "You are a helpful assistant.", hostile)
+    spec = make_spec(judge={"model": "judge-model", "mode": "pairwise"})
+    run_id = await run_experiment(spec, store, client)
+
+    assert store.get_run(run_id)["status"] == "complete"
+    judge_calls = [r for r in client.calls if r.model == "judge-model"]
+    assert judge_calls
+    assert all(hostile in r.user for r in judge_calls)

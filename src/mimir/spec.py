@@ -59,12 +59,15 @@ class Dataset(BaseModel):
         for index, item in enumerate(items):
             for field, value in item.items():
                 try:
-                    json.dumps(value)
+                    # Probe must match canonical_json semantics (ensure_ascii=False +
+                    # utf-8 encode): default json.dumps accepts lone surrogates that
+                    # would crash create_run.
+                    json.dumps(value, ensure_ascii=False).encode("utf-8")
                 except (TypeError, ValueError):
                     raise ValueError(
                         f"dataset item {item.get('id', index)!r} field {field!r}: value"
-                        f" {value!r} is not JSON-serializable (quote YAML dates/timestamps"
-                        " as strings)"
+                        f" {value!r} is not JSON-serializable UTF-8 (quote YAML"
+                        " dates/timestamps as strings; lone surrogates are rejected)"
                     ) from None
         return items
 
@@ -205,6 +208,16 @@ def load_items(spec: ExperimentSpec, base_dir: str | Path) -> list[dict[str, Any
                 raise ValueError(f"{path}:{line_number}: invalid JSON: {exc}") from exc
             if not isinstance(record, dict):
                 raise ValueError(f"{path}:{line_number}: each JSONL line must be an object")
+            for field, value in record.items():
+                try:
+                    # Same probe as Dataset._items_json_safe: json.loads accepts lone
+                    # "\ud800" escapes that canonical_json cannot utf-8 encode.
+                    json.dumps(value, ensure_ascii=False).encode("utf-8")
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"{path}:{line_number}: field {field!r}: value {value!r} is not"
+                        " JSON-serializable UTF-8 (lone surrogates are rejected)"
+                    ) from None
             items.append(record)
 
     if not items:
