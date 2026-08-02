@@ -241,12 +241,14 @@ def test_store_public_surface_is_pinned_to_append_only_allowlist(store):
     # DESIGN.md §4 before it ships.
     expected = {
         "add_condition",
+        "add_judgment",
         "add_sample",
         "cache_get",
         "cache_put",
         "close",
         "create_run",
         "get_conditions",
+        "get_judgments",
         "get_run",
         "get_samples",
         "set_run_status",
@@ -366,6 +368,103 @@ def test_add_sample_survives_lone_surrogate_response(store):
     )
     (row,) = store.get_samples(run_id)
     assert row["raw_response"] == "pre?post"
+
+
+def make_sample(s, run_id, condition_id, *, item_id="q1", sample_index=0, key="ab" * 32):
+    return s.add_sample(
+        run_id=run_id,
+        condition_id=condition_id,
+        item_id=item_id,
+        sample_index=sample_index,
+        cache_key=key,
+        request_json="{}",
+        response_text="text",
+    )
+
+
+def test_add_judgment_roundtrip_pairwise(store):
+    run_id, condition_id = make_run_with_condition(store)
+    sample_a = make_sample(store, run_id, condition_id, sample_index=0)
+    sample_b = make_sample(store, run_id, condition_id, sample_index=1)
+    judgment_id = store.add_judgment(
+        run_id=run_id,
+        item_id="q1",
+        judge_model="judge-model",
+        mode="pairwise",
+        sample_a_id=sample_a,
+        sample_b_id=sample_b,
+        position_order="ab",
+        cache_key="fe" * 32,
+        raw_response='{"content": "A"}',
+        verdict="A",
+        latency_ms=9.5,
+        input_tokens=50,
+        output_tokens=1,
+    )
+    (row,) = store.get_judgments(run_id)
+    assert row["id"] == judgment_id
+    assert row["run_id"] == run_id
+    assert row["item_id"] == "q1"
+    assert row["judge_model"] == "judge-model"
+    assert row["mode"] == "pairwise"
+    assert row["sample_a_id"] == sample_a
+    assert row["sample_b_id"] == sample_b
+    assert row["position_order"] == "ab"
+    assert row["cache_key"] == "fe" * 32
+    assert row["raw_response"] == '{"content": "A"}'
+    assert row["verdict"] == "A"
+    assert row["score"] is None
+    assert row["latency_ms"] == 9.5
+    assert row["input_tokens"] == 50
+    assert row["output_tokens"] == 1
+    assert row["error"] is None
+
+
+def test_add_judgment_rubric_allows_null_pair_fields(store):
+    run_id, condition_id = make_run_with_condition(store)
+    sample_a = make_sample(store, run_id, condition_id)
+    store.add_judgment(
+        run_id=run_id,
+        item_id="q1",
+        judge_model="judge-model",
+        mode="rubric",
+        sample_a_id=sample_a,
+        cache_key="fd" * 32,
+        raw_response="8",
+        score=8.0,
+    )
+    (row,) = store.get_judgments(run_id)
+    assert row["sample_b_id"] is None
+    assert row["position_order"] is None
+    assert row["verdict"] is None
+    assert row["score"] == 8.0
+
+
+def test_judgment_with_bogus_run_id_rejected(store):
+    run_id, condition_id = make_run_with_condition(store)
+    sample_a = make_sample(store, run_id, condition_id)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.add_judgment(
+            run_id="20990101-000000-dead",
+            item_id="q1",
+            judge_model="j",
+            mode="pairwise",
+            sample_a_id=sample_a,
+            cache_key="fc" * 32,
+        )
+
+
+def test_judgment_with_bogus_sample_id_rejected(store):
+    run_id, _ = make_run_with_condition(store)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.add_judgment(
+            run_id=run_id,
+            item_id="q1",
+            judge_model="j",
+            mode="pairwise",
+            sample_a_id=999999,
+            cache_key="fb" * 32,
+        )
 
 
 def test_sample_with_condition_from_other_run_rejected(store):

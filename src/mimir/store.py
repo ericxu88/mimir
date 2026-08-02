@@ -66,6 +66,28 @@ CREATE TABLE IF NOT EXISTS cache (
   response_json TEXT NOT NULL,
   created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS judgments (
+  id             INTEGER PRIMARY KEY,
+  run_id         TEXT NOT NULL REFERENCES runs(id),
+  item_id        TEXT NOT NULL,
+  judge_model    TEXT NOT NULL,
+  mode           TEXT NOT NULL,
+  sample_a_id    INTEGER NOT NULL REFERENCES samples(id),
+  sample_b_id    INTEGER REFERENCES samples(id),
+  position_order TEXT,
+  cache_key      TEXT NOT NULL,
+  raw_response   TEXT,
+  verdict        TEXT,
+  score          REAL,
+  latency_ms     REAL,
+  input_tokens   INTEGER,
+  output_tokens  INTEGER,
+  error          TEXT,
+  created_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_judgments_run_id ON judgments(run_id);
 """
 
 _RUN_ID_ATTEMPTS = 5
@@ -232,6 +254,60 @@ class Store:
             "INSERT OR IGNORE INTO cache (key, response_json, created_at) VALUES (?, ?, ?)",
             (key, _utf8_safe(text), _utc_now_iso()),
         )
+
+    def add_judgment(
+        self,
+        *,
+        run_id: str,
+        item_id: str,
+        judge_model: str,
+        mode: str,
+        sample_a_id: int,
+        sample_b_id: int | None = None,
+        position_order: str | None = None,
+        cache_key: str,
+        raw_response: str | None = None,
+        verdict: str | None = None,
+        score: float | None = None,
+        latency_ms: float | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        error: str | None = None,
+    ) -> int:
+        # sample_a_id/sample_b_id are the samples PRESENTED in positions A/B;
+        # position_order records which variant order that was ('ab' = declared order).
+        cursor = self._conn.execute(
+            "INSERT INTO judgments"
+            " (run_id, item_id, judge_model, mode, sample_a_id, sample_b_id, position_order,"
+            "  cache_key, raw_response, verdict, score, latency_ms, input_tokens, output_tokens,"
+            "  error, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                item_id,
+                judge_model,
+                mode,
+                sample_a_id,
+                sample_b_id,
+                position_order,
+                cache_key,
+                _utf8_safe(raw_response),
+                verdict,
+                score,
+                latency_ms,
+                input_tokens,
+                output_tokens,
+                _utf8_safe(error),
+                _utc_now_iso(),
+            ),
+        )
+        return int(cursor.lastrowid)  # type: ignore[arg-type]
+
+    def get_judgments(self, run_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM judgments WHERE run_id = ? ORDER BY id", (run_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
