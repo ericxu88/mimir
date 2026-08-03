@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="mimir" width="520">
+  <img src="assets/logo.png" alt="mimir" width="100%">
 </p>
 
 # mimir (WIP)
