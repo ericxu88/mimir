@@ -1,0 +1,21 @@
+# Judgeless two-variant experiment over a tiny JSONL dataset.
+# Runnable offline (deterministic canned client, no API key):
+#
+#   mimir run examples/quickstart.yaml --mock
+#
+# Then: mimir analyze <run-id>   (add --html for the static report)
+name: quickstart-greeting-tone
+description: Does a warmer system prompt change answer quality?
+variants:
+  - name: control
+    system: You are a helpful assistant. Answer concisely.
+    user_template: "{input}"
+  - name: friendly
+    system: You are a warm, encouraging assistant. Answer concisely.
+    user_template: "{input}"
+dataset:
+  path: dataset.jsonl # resolved relative to this spec file
+sampling:
+  model: claude-haiku-4-5-20251001
+  max_tokens: 300
+n_samples: 2

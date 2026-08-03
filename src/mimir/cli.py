@@ -5,8 +5,10 @@ files, and a run that ends `failed`); 2 argparse usage errors (its own SystemExi
 deliberately uncaught). Reports go to stdout; warnings and notices go to stderr so
 stdout stays parseable. Bare `mimir` prints the version and exits 0 (M0 contract).
 
-M5 runs only against the deterministic MockClient (`--mock` required); the real
-Anthropic client arrives in M6 and becomes the default in `_make_client`.
+`run` uses the real Anthropic client by default (its constructor reads
+ANTHROPIC_API_KEY; a missing key raises ValueError, caught by `_cmd_run`'s
+standard exit-1 path before the store is created). `--mock` swaps in the
+deterministic MockClient and never touches the environment.
 """
 
 import argparse
@@ -19,6 +21,7 @@ from pathlib import Path
 import yaml
 
 from mimir import __version__
+from mimir.clients.anthropic import AnthropicClient
 from mimir.clients.base import Client
 from mimir.clients.mock import MockClient
 from mimir.judge_audit import audit_judge
@@ -54,15 +57,13 @@ def _open_store(path: str) -> Store:
 
 
 def _make_client(args: argparse.Namespace) -> Client:
-    if not args.mock:
-        raise ValueError(
-            "no real API client until M6; pass --mock to run against the deterministic mock client"
+    if args.mock:  # mock branch first: --mock must never read the environment
+        print(
+            "note: using the deterministic mock client; responses are canned",
+            file=sys.stderr,
         )
-    print(
-        "note: using the deterministic mock client; responses are canned (real client lands in M6)",
-        file=sys.stderr,
-    )
-    return MockClient()
+        return MockClient()
+    return AnthropicClient()
 
 
 def _warn_on_status(status: str, run_id: str) -> None:
@@ -161,7 +162,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("spec", help="path to the experiment spec YAML")
     run_p.add_argument("--db", default="mimir.db", help=_DB_HELP)
     run_p.add_argument(
-        "--mock", action="store_true", help="run against the deterministic mock client"
+        "--mock",
+        action="store_true",
+        help="run offline against the deterministic mock client (no API key needed)",
     )
     run_p.set_defaults(func=_cmd_run)
 

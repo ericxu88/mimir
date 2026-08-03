@@ -85,15 +85,36 @@ def test_analyze_without_run_id_usage_error():
 # --- mimir run --------------------------------------------------------------------
 
 
-def test_run_without_mock_flag_errors(tmp_path, capsys):
+def test_run_without_key_and_without_mock_errors(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     spec_path = tmp_path / "spec.yaml"
     spec_path.write_text(yaml.safe_dump(spec_dict()), encoding="utf-8")
     db = tmp_path / "results.db"
     assert main(["run", str(spec_path), "--db", str(db)]) == 1
     captured = capsys.readouterr()
     assert "error:" in captured.err
-    assert "--mock" in captured.err
-    assert not db.exists()  # rejected before the store is opened
+    assert "ANTHROPIC_API_KEY" in captured.err
+    assert not db.exists()  # client construction fails before the store is opened
+
+
+def test_run_mock_needs_no_api_key(tmp_path, monkeypatch, capsys):
+    # The mock branch must never read the environment.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(yaml.safe_dump(spec_dict()), encoding="utf-8")
+    assert main(["run", str(spec_path), "--db", str(tmp_path / "r.db"), "--mock"]) == 0
+
+
+def test_run_without_mock_uses_real_client(tmp_path, monkeypatch, capsys):
+    # Stub the class at the cli seam (never let a real key on the dev machine
+    # construct a live client). MockClient's zero-arg constructor fits the call.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr("mimir.cli.AnthropicClient", MockClient)
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(yaml.safe_dump(spec_dict()), encoding="utf-8")
+    assert main(["run", str(spec_path), "--db", str(tmp_path / "r.db")]) == 0
+    captured = capsys.readouterr()
+    assert "mock client" not in captured.err  # the notice belongs to --mock only
 
 
 def test_run_mock_judgeless_end_to_end(tmp_path, monkeypatch, capsys):
@@ -118,16 +139,16 @@ def test_run_mock_judgeless_end_to_end(tmp_path, monkeypatch, capsys):
     assert "samples: 4 (0 errors)" in captured.out
     assert "judgments: 0 (0 errors)" in captured.out
     assert (  # the exact canned-client notice is contract, pinned on stderr
-        "note: using the deterministic mock client; responses are canned"
-        " (real client lands in M6)" in captured.err
+        "note: using the deterministic mock client; responses are canned" in captured.err
     )
+    assert "lands in M6" not in captured.err  # stale-suffix guard
     with Store(db) as store:
         assert store.get_run(match.group(1))["status"] == "complete"
 
 
 def test_run_judged_spec_under_mock_fails(tmp_path, capsys):
     # MockClient's derived texts don't parse as verdicts: honest `failed`, exit 1
-    # (documented as expected until M6's real client).
+    # (by design: use the real client for judged runs).
     spec_path = tmp_path / "spec.yaml"
     spec_path.write_text(
         yaml.safe_dump(spec_dict(judge={"model": "judge-model", "mode": "pairwise"})),

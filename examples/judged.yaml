@@ -1,0 +1,26 @@
+# Same experiment plus a pairwise LLM judge. Needs the real client:
+#
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   mimir run examples/judged.yaml
+#
+# Then: mimir analyze <run-id>  and  mimir audit-judge <run-id>
+# (Under --mock this run honestly ends `failed`: canned responses never
+# parse as A/B/TIE verdicts. Judged runs are a real-client feature.)
+name: judged-greeting-tone
+description: Pairwise-judged comparison of the two prompt variants.
+variants:
+  - name: control
+    system: You are a helpful assistant. Answer concisely.
+    user_template: "{input}"
+  - name: friendly
+    system: You are a warm, encouraging assistant. Answer concisely.
+    user_template: "{input}"
+dataset:
+  path: dataset.jsonl # resolved relative to this spec file
+sampling:
+  model: claude-haiku-4-5-20251001
+  max_tokens: 300
+n_samples: 2
+judge:
+  model: claude-haiku-4-5-20251001
+  mode: pairwise
