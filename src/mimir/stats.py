@@ -204,14 +204,16 @@ def pairwise_item_scores(
     values_a: dict[str, list[float]] = {}
     used = errored = 0
     for row in judgments:
-        # Defensive second clause: the runner never writes a NULL/unknown verdict
-        # without an error, but analysis must not crash on drifted data.
+        # Defensive clauses: the runner never writes a NULL/unknown verdict without
+        # an error, nor a judgment referencing another run's sample (FK-valid but
+        # drifted), and analysis must not crash on either.
         value = _VERDICT_VALUE.get(row["verdict"])
-        if row["error"] is not None or value is None:
+        presented_a = sample_variant.get(row["sample_a_id"])
+        if row["error"] is not None or value is None or presented_a is None:
             errored += 1
             continue
         used += 1
-        if sample_variant[row["sample_a_id"]] != variant_a:
+        if presented_a != variant_a:
             value = 1.0 - value  # presented-A was the later-declared variant
         values_a.setdefault(row["item_id"], []).append(value)
     scores_a = {item: float(np.mean(values)) for item, values in values_a.items()}
@@ -235,11 +237,13 @@ def rubric_item_scores(
     values: dict[str, dict[str, list[float]]] = {row["variant_name"]: {} for row in conditions}
     used = errored = 0
     for row in judgments:
-        if row["error"] is not None or row["score"] is None:
+        # Third clause: a judgment referencing another run's sample is FK-valid
+        # but drifted — skip-and-count, never KeyError (matches judge_audit).
+        variant = sample_variant.get(row["sample_a_id"])
+        if row["error"] is not None or row["score"] is None or variant is None:
             errored += 1
             continue
         used += 1
-        variant = sample_variant[row["sample_a_id"]]
         values[variant].setdefault(row["item_id"], []).append(float(row["score"]))
     scores = {
         variant: {item: float(np.mean(item_values)) for item, item_values in per_item.items()}

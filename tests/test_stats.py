@@ -839,3 +839,54 @@ class TestMathInputValidation:
 def test_resampling_counts_must_be_positive(call):
     with pytest.raises(ValueError, match=">= 1"):
         call()
+
+
+# --- review-driven hardening (M5): foreign-sample drifted rows --------------------
+
+
+def test_pairwise_foreign_sample_judgment_counted_errored(store):
+    # judgments.sample_a_id is FK-valid against ANY run's samples; a row referencing
+    # another run's sample is drifted data and must skip-and-count, never KeyError
+    # (found by the M5 review: analyze crashed where audit-judge handled it).
+    run_id, cond = make_run(store)
+    control_sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    treatment_sid = add_ok_sample(store, run_id, cond["treatment"], "q1")
+    add_pair_judgment(
+        store,
+        run_id,
+        "q1",
+        order="ab",
+        verdict="A",
+        control_sid=control_sid,
+        treatment_sid=treatment_sid,
+    )
+    other_run, other_cond = make_run(store)
+    foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
+    store.add_judgment(
+        run_id=run_id,
+        item_id="q1",
+        judge_model="judge-model",
+        mode="pairwise",
+        sample_a_id=foreign_sid,
+        sample_b_id=treatment_sid,
+        position_order="ab",
+        cache_key="j" * 64,
+        verdict="A",
+    )
+    table = pairwise_item_scores(*tables(store, run_id))
+    assert table.n_judgments_used == 1
+    assert table.n_judgments_errored == 1
+    assert table.scores["control"] == {"q1": 1.0}
+
+
+def test_rubric_foreign_sample_judgment_counted_errored(store):
+    run_id, cond = make_run(store, mode="rubric")
+    sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=7)
+    other_run, other_cond = make_run(store, mode="rubric")
+    foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
+    add_rubric_judgment(store, run_id, "q2", sample_id=foreign_sid, score=3)
+    table = rubric_item_scores(*tables(store, run_id))
+    assert table.n_judgments_used == 1
+    assert table.n_judgments_errored == 1
+    assert table.scores["control"] == {"q1": 7.0}

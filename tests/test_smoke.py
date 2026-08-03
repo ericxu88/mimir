@@ -11,5 +11,7 @@ def test_version_matches_distribution_metadata():
 
 
 def test_cli_main_prints_name_and_version(capsys):
-    assert main() == 0
+    # main([]) not main(): with argv=None the CLI reads sys.argv, which under
+    # pytest holds pytest's own arguments. The behavior contract is unchanged.
+    assert main([]) == 0
     assert capsys.readouterr().out.strip() == f"mimir {mimir.__version__}"
