@@ -364,3 +364,81 @@ def test_run_default_db_filename(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     assert main(["run", str(spec_path), "--mock"]) == 0
     assert (tmp_path / "mimir.db").exists()
+
+
+# --- M7: analyze --correction -----------------------------------------------------
+
+
+def seed_rubric_multiarm_run(db_path):
+    """Three rubric variants seeded directly through the store: C(3,2) = 3 pairs."""
+    spec = {"name": "multi", "judge": {"model": "judge-model", "mode": "rubric"}}
+    scores = {
+        "a": {"q1": 2.0, "q2": 4.0},
+        "b": {"q1": 5.0, "q2": 7.0},
+        "c": {"q1": 9.0, "q2": 3.0},
+    }
+    with Store(db_path) as store:
+        run_id = store.create_run("multi", spec)
+        for name, per_item in scores.items():
+            cid = store.add_condition(
+                run_id,
+                variant_name=name,
+                system_prompt="",
+                user_template="A: {input}",
+                sampling={"model": "m"},
+            )
+            for item, score in per_item.items():
+                sid = store.add_sample(
+                    run_id=run_id,
+                    condition_id=cid,
+                    item_id=item,
+                    sample_index=0,
+                    cache_key="k" * 64,
+                    request_json="{}",
+                    raw_response="{}",
+                    response_text="r",
+                    latency_ms=1.0,
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+                store.add_judgment(
+                    run_id=run_id,
+                    item_id=item,
+                    judge_model="judge-model",
+                    mode="rubric",
+                    sample_a_id=sid,
+                    cache_key="j" * 64,
+                    score=score,
+                )
+        store.set_run_status(run_id, "complete")
+    return run_id
+
+
+def test_analyze_multiarm_reports_corrected(tmp_path, capsys):
+    db = tmp_path / "results.db"
+    run_id = seed_rubric_multiarm_run(db)
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "multiple comparisons: 3 pairs" in captured.out
+    assert "holm-corrected" in captured.out
+    assert captured.err == ""
+
+
+def test_analyze_correction_flag_bh(tmp_path, capsys):
+    db = tmp_path / "results.db"
+    run_id = seed_rubric_multiarm_run(db)
+    assert main(["analyze", run_id, "--db", str(db), "--correction", "bh"]) == 0
+    assert "bh-corrected" in capsys.readouterr().out
+
+
+def test_analyze_correction_flag_invalid_usage_error(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        main(["analyze", "some-run", "--db", str(tmp_path / "x.db"), "--correction", "bonferroni"])
+    assert excinfo.value.code == 2
+
+
+def test_analyze_correction_flag_on_two_variant_run(tmp_path, capsys):
+    db = tmp_path / "results.db"
+    run_id = seed_judged_run(db)
+    assert main(["analyze", run_id, "--db", str(db), "--correction", "holm"]) == 0
+    assert capsys.readouterr().err == ""

@@ -7,18 +7,31 @@ and resampling seeds are pinned literals, pre-screened so every assertion holds 
 wide margin. Never change a seed to make a test pass — that inverts the oracle.
 """
 
+import re
+import zlib
+
 import numpy as np
 import pytest
 
+from mimir.clients.base import CompletionResponse
 from mimir.clients.mock import MockClient
 from mimir.runner import run_experiment
 from mimir.spec import ExperimentSpec
 from mimir.stats import (
+    DEFAULT_CORRECTION,
+    ReplicateTable,
     analyze_run,
+    benjamini_hochberg,
     bootstrap_ci,
+    decompose_variance,
+    holm_bonferroni,
     pairwise_item_scores,
+    pairwise_replicate_scores,
+    replicate_diffs,
     required_items_for_power,
     rubric_item_scores,
+    rubric_replicate_scores,
+    score_variance_shares,
     sign_flip_pvalue,
 )
 from mimir.store import Store
@@ -890,3 +903,739 @@ def test_rubric_foreign_sample_judgment_counted_errored(store):
     assert table.n_judgments_used == 1
     assert table.n_judgments_errored == 1
     assert table.scores["control"] == {"q1": 7.0}
+
+
+# --- M7: common random numbers — variance quantification --------------------------
+
+
+def test_crn_shared_noise_cuts_paired_diff_variance_by_the_theoretical_factor():
+    # Validation test (GREEN on arrival — no production code under test beyond
+    # required_items_for_power): quantifies WHY the CRN + item-pairing design
+    # reduces variance. Model: score(v, i) = mu_v + b_i + (s_i + u_{v,i}) with b
+    # the item effect, s the seed-shared noise component, u idiosyncratic.
+    #   Var(unpaired diff)          = 2(sb^2 + ss^2 + su^2) = 2.9
+    #   Var(paired, indep noise)    = 2(ss^2 + su^2)        = 0.9   (b cancels)
+    #   Var(paired + CRN)           = 2su^2                 = 0.18  (s cancels too)
+    # Theoretical CRN reduction 1/(1 - rho) = 5.0 at rho = 0.8. Data seed 2 is
+    # pre-screened: realized 2.9389 / 0.9677 / 0.1906, ratio 5.078, required
+    # items 85 (independent) vs 15 (CRN). Never change the seed to make an
+    # assertion pass.
+    rng = np.random.default_rng(2)
+    n, delta = 400, 0.3
+    sigma_b, sigma_s, sigma_u = 1.0, 0.6, 0.3
+    b, b_other = rng.normal(0.0, sigma_b, (2, n))
+    s_a, s_b, s_shared = rng.normal(0.0, sigma_s, (3, n))
+    u_a1, u_b1, u_a2, u_b2 = rng.normal(0.0, sigma_u, (4, n))
+    d_unpaired = (b_other + delta + s_b + u_b1) - (b + s_a + u_a1)
+    d_ind = (b + delta + s_b + u_b1) - (b + s_a + u_a1)
+    d_crn = (b + delta + s_shared + u_b2) - (b + s_shared + u_a2)
+    var_unpaired = float(np.var(d_unpaired, ddof=1))
+    var_ind = float(np.var(d_ind, ddof=1))
+    var_crn = float(np.var(d_crn, ddof=1))
+    assert var_unpaired > var_ind > var_crn
+    assert 2.5 < var_unpaired < 3.3
+    assert 0.75 < var_ind < 1.15
+    assert 0.14 < var_crn < 0.24
+    assert 4.0 < var_ind / var_crn < 6.5
+    assert required_items_for_power(d_ind) == 85
+    assert required_items_for_power(d_crn) == 15
+
+
+class _EchoJudgeClient:
+    """Rubric judge that parrots the SCORE=<n> marker embedded in the prompt, so
+    judged scores equal the sampled values and analyze_run reads sampling noise
+    directly. Subclasses define how sample text derives from the request."""
+
+    async def complete(self, request):
+        if request.model == "judge-model":
+            text = re.search(r"SCORE=(\d+)", request.user).group(1)
+        else:
+            text = f"SCORE={self._sample_value(request)}"
+        return CompletionResponse(
+            text=text,
+            raw={},
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1.0,
+            model=request.model,
+        )
+
+
+class SeedHonoringClient(_EchoJudgeClient):
+    # Pure function of request.seed ONLY — the M7 CRN contract is that the seed
+    # alone identifies the replicate's random state; prompt content is ignored.
+    def _sample_value(self, request):
+        return 1 + (request.seed * 7) % 10  # 1..10; distinct for consecutive seeds
+
+
+class PromptSensitiveClient(_EchoJudgeClient):
+    # A real LLM without wire-level seeding: noise depends on the whole request,
+    # so shared seeds cannot make it cancel across variants.
+    def _sample_value(self, request):
+        blob = f"{request.seed}|{request.system}|{request.user}".encode()
+        return 1 + zlib.crc32(blob) % 10
+
+
+def _crn_spec(items):
+    return ExperimentSpec.model_validate(
+        {
+            "name": "crn-null",
+            "variants": [
+                {"name": "control", "system": "You are helpful.", "user_template": "A: {input}"},
+                {"name": "friendly", "system": "You are warm.", "user_template": "A: {input}"},
+            ],
+            "dataset": {"items": items},
+            "sampling": {"model": "claude-haiku-4-5-20251001", "seed": 7},
+            "n_samples": 3,
+            "judge": {"model": "judge-model", "mode": "rubric"},
+            "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+        }
+    )
+
+
+_CRN_ITEMS = [{"id": f"q{i}", "input": f"question {i}"} for i in range(1, 5)]
+
+
+@pytest.mark.anyio
+async def test_crn_seed_honoring_client_zero_variance_under_null(store):
+    # With CRN seeds (sampling.seed + sample_index, shared across variants) a
+    # client whose stochasticity depends on request.seed ONLY gives replicate r
+    # of both variants identical output — under the null every paired diff is
+    # EXACTLY zero. len(set(scores)) == 3 is the anti-degeneracy guard and the
+    # RED mechanism: without the CRN derivation every replicate carries seed 7
+    # and all 24 judged scores collapse to one value.
+    run_id = await run_experiment(_crn_spec(_CRN_ITEMS), store, SeedHonoringClient())
+    assert store.get_run(run_id)["status"] == "complete"
+    scores = {j["score"] for j in store.get_judgments(run_id)}
+    assert len(scores) == 3  # seeds 7, 8, 9 -> values 10.0, 7.0, 4.0
+    comparison = analyze_run(store, run_id).comparisons[0]
+    assert comparison.diffs == (0.0, 0.0, 0.0, 0.0)  # exactly zero, not approx
+    assert comparison.mean_diff == 0.0
+    assert (comparison.ci_low, comparison.ci_high) == (0.0, 0.0)
+    assert comparison.p_value == 1.0
+
+
+@pytest.mark.anyio
+async def test_prompt_sensitive_client_diffs_not_cancelled_by_crn(store):
+    # Contrast fixture (GREEN before and after M7): when noise depends on the
+    # prompt — as on a real API with no wire seed — shared seeds cannot cancel
+    # it, so the zero in the null test above comes from seed-honoring, not from
+    # the pipeline. crc32 is platform-stable; realized diffs pre-screened nonzero.
+    run_id = await run_experiment(_crn_spec(_CRN_ITEMS), store, PromptSensitiveClient())
+    assert store.get_run(run_id)["status"] == "complete"
+    comparison = analyze_run(store, run_id).comparisons[0]
+    assert any(diff != 0.0 for diff in comparison.diffs)
+
+
+# --- M7: multiple-comparison corrections (pure math) ------------------------------
+
+
+def test_holm_and_bh_step_shapes_hand_computed():
+    # Sorted p = (0.015625, 0.25, 0.25, 0.25), m = 4.
+    # Holm scales (4,3,2,1): (0.0625, 0.75, 0.50, 0.25) -> running max ->
+    #   (0.0625, 0.75, 0.75, 0.75).
+    # BH scales (4/1, 4/2, 4/3, 4/4): (0.0625, 0.5, 1/3, 0.25) -> reverse running
+    #   min -> (0.0625, 0.25, 0.25, 0.25). All values dyadic: exact ==.
+    p = (0.015625, 0.25, 0.25, 0.25)
+    assert holm_bonferroni(p) == (0.0625, 0.75, 0.75, 0.75)
+    assert benjamini_hochberg(p) == (0.0625, 0.25, 0.25, 0.25)
+
+
+def test_corrections_preserve_input_order():
+    p = (0.25, 0.015625, 0.25, 0.25)
+    assert holm_bonferroni(p) == (0.75, 0.0625, 0.75, 0.75)
+    assert benjamini_hochberg(p) == (0.25, 0.0625, 0.25, 0.25)
+
+
+def test_holm_clips_at_one_bh_capped_by_largest_p():
+    # Holm: (2*0.6, 1*0.7) -> max -> (1.2, 1.2) -> clipped (1.0, 1.0).
+    # BH: (2*0.6/1, 2*0.7/2) = (1.2, 0.7) -> reverse min -> (0.7, 0.7): the
+    # largest adjusted BH value is p_(m) itself, so the clip is a no-op here.
+    assert holm_bonferroni((0.6, 0.7)) == (1.0, 1.0)
+    assert benjamini_hochberg((0.6, 0.7)) == (0.7, 0.7)
+
+
+def test_textbook_ladder():
+    # Holm on (0.01..0.05): scales (5,4,3,2,1) -> (0.05, 0.08, 0.09, 0.08, 0.05)
+    # -> running max -> (0.05, 0.08, 0.09, 0.09, 0.09). Exact in float.
+    # BH: every m*p_(i)/i is 0.05 in real arithmetic, but 5*0.03/3 is
+    # 0.049999999999999996 in float -> approx, never a loosened oracle.
+    p = (0.01, 0.02, 0.03, 0.04, 0.05)
+    assert holm_bonferroni(p) == (0.05, 0.08, 0.09, 0.09, 0.09)
+    assert benjamini_hochberg(p) == pytest.approx([0.05] * 5, abs=1e-12)
+
+
+def test_corrections_m1_identity():
+    assert holm_bonferroni((0.37,)) == (0.37,)
+    assert benjamini_hochberg((0.37,)) == (0.37,)
+
+
+def test_corrections_all_equal_ties():
+    # Ties get identical adjusted values through the accumulates, no special case:
+    # Holm's running max propagates the largest scale, BH's reverse min the smallest.
+    p = (0.25, 0.25, 0.25, 0.25)
+    assert holm_bonferroni(p) == (1.0, 1.0, 1.0, 1.0)
+    assert benjamini_hochberg(p) == (0.25, 0.25, 0.25, 0.25)
+
+
+def test_corrections_mixed_unsorted_vector():
+    p = (0.001, 0.9, 0.02, 0.6, 0.04)
+    assert holm_bonferroni(p) == (0.005, 1.0, 0.08, 1.0, 0.12)
+    # 5*0.04/3 = 0.2/3 is non-dyadic -> approx on the BH vector.
+    assert benjamini_hochberg(p) == pytest.approx(
+        [0.005, 0.9, 0.05, 0.75, 0.06666666666666667], abs=1e-12
+    )
+
+
+def test_corrections_monotone_and_bh_dominates_holm():
+    # On any vector: adjusted values ordered by raw-p rank are non-decreasing,
+    # and BH <= Holm elementwise (scale m/i <= m-i+1 for every rank i, and the
+    # accumulates preserve the inequality). Deterministic, not probabilistic.
+    p = np.random.default_rng(0).random(20)
+    order = np.argsort(p)
+    for correct in (holm_bonferroni, benjamini_hochberg):
+        adjusted = np.asarray(correct(p))
+        ranked = adjusted[order]
+        assert (np.diff(ranked) >= 0).all()
+    holm = holm_bonferroni(p)
+    bh = benjamini_hochberg(p)
+    assert all(b <= h for b, h in zip(bh, holm, strict=True))
+
+
+@pytest.mark.parametrize("correct", [holm_bonferroni, benjamini_hochberg])
+class TestPValueValidation:
+    def test_empty_rejected(self, correct):
+        with pytest.raises(ValueError, match="empty"):
+            correct([])
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_rejected(self, correct, bad):
+        with pytest.raises(ValueError, match="finite"):
+            correct([0.5, bad])
+
+    @pytest.mark.parametrize("bad", [-0.1, 1.5])
+    def test_out_of_range_rejected(self, correct, bad):
+        with pytest.raises(ValueError, match=r"\[0, 1\]"):
+            correct([0.5, bad])
+
+
+def test_null_calibration_uncorrected_vs_corrected():
+    # Known-answer FDR/FWER calibration on m = 10 INDEPENDENT Uniform(0,1)
+    # p-vectors, where the theory is exact: uncorrected any-rejection is
+    # 1 - 0.95^10 = 0.4013 ("~40% false-positive runs"); BH any-discovery under
+    # the global null equals alpha (Simes); Holm is Bonferroni-like on the min.
+    # Seed 0, N = 10,000 pre-screened realized rates: 0.3994 / 0.0489 / 0.0473.
+    # NOTE the brief's "10 conditions -> ~40%": 10 CONDITIONS give C(10,2) = 45
+    # dependent comparisons with an any-false-winner rate near 0.75; the 40%
+    # figure is exactly m = 10 independent tests, which is what this simulates.
+    # Sign-flip p-values are discrete and super-uniform under the null, so the
+    # corrections are conservative there — uniforms are the exact contract.
+    # Never change the seed to make an assertion pass.
+    rows = np.random.default_rng(0).random((10_000, 10))
+    alpha = 0.05
+    uncorrected = float(np.mean(rows.min(axis=1) < alpha))
+    bh_rate = float(np.mean([min(benjamini_hochberg(row)) < alpha for row in rows]))
+    holm_rate = float(np.mean([min(holm_bonferroni(row)) < alpha for row in rows]))
+    assert 0.38 < uncorrected < 0.42
+    assert 0.04 < bh_rate < 0.06
+    assert 0.04 < holm_rate < 0.06
+    assert uncorrected > 5 * bh_rate
+    assert holm_rate <= bh_rate
+
+
+# --- M7: replicate-level extraction -----------------------------------------------
+
+
+def test_rubric_replicate_scores_keyed_by_sample_index(store):
+    run_id, cond = make_run(store, mode="rubric")
+    for name, base in (("control", 3), ("treatment", 5)):
+        for item in ("q1", "q2"):
+            for index in (0, 1):
+                sid = add_ok_sample(store, run_id, cond[name], item, sample_index=index)
+                add_rubric_judgment(store, run_id, item, sample_id=sid, score=base + index)
+    table = rubric_replicate_scores(*tables(store, run_id))
+    assert table.scores == {
+        "control": {"q1": {0: 3.0, 1: 4.0}, "q2": {0: 3.0, 1: 4.0}},
+        "treatment": {"q1": {0: 5.0, 1: 6.0}, "q2": {0: 5.0, 1: 6.0}},
+    }
+    assert table.n_judgments_used == 8
+    assert table.n_judgments_errored == 0
+
+
+def test_pairwise_replicate_scores_average_both_orders_within_replicate(store):
+    # Split verdict across orders: 'ab' A -> control wins (1.0), 'ba' A ->
+    # treatment wins (control 0.0) -> replicate mean 0.5 for both directions.
+    run_id, cond = make_run(store)
+    c_sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    t_sid = add_ok_sample(store, run_id, cond["treatment"], "q1")
+    add_pair_judgment(
+        store, run_id, "q1", order="ab", verdict="A", control_sid=c_sid, treatment_sid=t_sid
+    )
+    add_pair_judgment(
+        store, run_id, "q1", order="ba", verdict="A", control_sid=c_sid, treatment_sid=t_sid
+    )
+    table = pairwise_replicate_scores(*tables(store, run_id))
+    assert table.scores == {"control": {"q1": {0: 0.5}}, "treatment": {"q1": {0: 0.5}}}
+    assert table.n_judgments_used == 2
+
+
+def test_pairwise_replicate_scores_consistent_winner(store):
+    # 'ab' A and 'ba' B both mean control won -> 1.0, complementary 0.0.
+    run_id, cond = make_run(store)
+    c_sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    t_sid = add_ok_sample(store, run_id, cond["treatment"], "q1")
+    add_pair_judgment(
+        store, run_id, "q1", order="ab", verdict="A", control_sid=c_sid, treatment_sid=t_sid
+    )
+    add_pair_judgment(
+        store, run_id, "q1", order="ba", verdict="B", control_sid=c_sid, treatment_sid=t_sid
+    )
+    table = pairwise_replicate_scores(*tables(store, run_id))
+    assert table.scores == {"control": {"q1": {0: 1.0}}, "treatment": {"q1": {0: 0.0}}}
+
+
+def test_pairwise_replicate_scores_requires_two_conditions(store):
+    run_id, _ = make_run(store, variants=("only",))
+    with pytest.raises(ValueError, match="exactly two variants"):
+        pairwise_replicate_scores(*tables(store, run_id))
+
+
+def test_pairwise_replicate_scores_skip_and_count_drifted_rows(store):
+    run_id, cond = make_run(store)
+    c_sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    t_sid = add_ok_sample(store, run_id, cond["treatment"], "q1")
+    add_pair_judgment(
+        store, run_id, "q1", order="ab", verdict="A", control_sid=c_sid, treatment_sid=t_sid
+    )
+    add_pair_judgment(
+        store,
+        run_id,
+        "q1",
+        order="ba",
+        verdict="A",
+        control_sid=c_sid,
+        treatment_sid=t_sid,
+        error="boom",
+    )
+    other_run, other_cond = make_run(store)
+    foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
+    store.add_judgment(
+        run_id=run_id,
+        item_id="q1",
+        judge_model="judge-model",
+        mode="pairwise",
+        sample_a_id=foreign_sid,
+        sample_b_id=t_sid,
+        position_order="ab",
+        cache_key="j" * 64,
+        verdict="A",
+    )
+    table = pairwise_replicate_scores(*tables(store, run_id))
+    assert table.n_judgments_used == 1
+    assert table.n_judgments_errored == 2
+    assert table.scores["control"] == {"q1": {0: 1.0}}
+
+
+def test_rubric_replicate_scores_skip_and_count_drifted_rows(store):
+    run_id, cond = make_run(store, mode="rubric")
+    sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=7)
+    add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=3, error="boom")
+    other_run, other_cond = make_run(store, mode="rubric")
+    foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
+    add_rubric_judgment(store, run_id, "q2", sample_id=foreign_sid, score=5)
+    table = rubric_replicate_scores(*tables(store, run_id))
+    assert table.n_judgments_used == 1
+    assert table.n_judgments_errored == 2
+    assert table.scores["control"] == {"q1": {0: 7.0}}
+
+
+def test_replicate_diffs_pairs_by_index_and_drops_unmatched(store):
+    run_id, cond = make_run(store, mode="rubric")
+    # control q1 replicates {0, 1}; treatment q1 replicates {1, 2}; q2 control-only.
+    for index, score in ((0, 3), (1, 4)):
+        sid = add_ok_sample(store, run_id, cond["control"], "q1", sample_index=index)
+        add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=score)
+    for index, score in ((1, 9), (2, 8)):
+        sid = add_ok_sample(store, run_id, cond["treatment"], "q1", sample_index=index)
+        add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=score)
+    sid = add_ok_sample(store, run_id, cond["control"], "q2")
+    add_rubric_judgment(store, run_id, "q2", sample_id=sid, score=1)
+    table = rubric_replicate_scores(*tables(store, run_id))
+    diffs = replicate_diffs(table, "control", "treatment")
+    assert diffs == {"q1": (5.0,)}  # only index 1 shared: 9 - 4; q2 dropped
+
+
+def test_replicate_means_match_item_scores(store):
+    # Collapsing the replicate table by mean reproduces the ScoreTable values.
+    run_id, cond = make_run(store, mode="rubric")
+    for name, scores in (("control", (2, 4)), ("treatment", (5, 9))):
+        for index, score in enumerate(scores):
+            sid = add_ok_sample(store, run_id, cond[name], "q1", sample_index=index)
+            add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=score)
+    replicate_table = rubric_replicate_scores(*tables(store, run_id))
+    item_table = rubric_item_scores(*tables(store, run_id))
+    for variant in ("control", "treatment"):
+        collapsed = float(np.mean(list(replicate_table.scores[variant]["q1"].values())))
+        assert collapsed == item_table.scores[variant]["q1"]
+
+
+# --- M7: variance decomposition + power planning ----------------------------------
+
+
+def test_decompose_item_dominated_recommends_more_items():
+    # Item means -3, 1, 5 -> var_item_mean = 16; per-item ss = 2 each, pooled
+    # var_within = 6/3 = 2; var_between = 16 - 2*0.5 = 15. All dyadic: exact ==.
+    # Requirements: K = (z_a+z_p)^2 = 7.8488797...; ceil(K*16) = 126,
+    # ceil(K*15.5) = 122, ceil(K*15) = 118.
+    v = decompose_variance({"q1": [-4.0, -2.0], "q2": [0.0, 2.0], "q3": [4.0, 6.0]}, mean_diff=1.0)
+    assert v.n_items == 3
+    assert v.n_items_with_replicates == 3
+    assert v.mean_replicates == 2.0
+    assert v.var_item_mean == 16.0
+    assert v.var_within == 2.0
+    assert v.var_between == 15.0
+    assert v.share_between == 0.9375
+    assert v.n_required_items_current == 126
+    assert v.n_required_items_double == 122
+    assert v.n_required_items_limit == 118
+    assert v.recommendation == "more_items"
+
+
+def test_decompose_noise_dominated_recommends_more_samples():
+    # Item means 0, 1, 2 -> var_item_mean = 1; per-item ss = 32 each, pooled
+    # var_within = 96/3 = 32; var_between = max(0, 1 - 16) = 0 (clamped).
+    # Deliberately the SAME current requirement as the item-dominated case (126)
+    # with the opposite advice: ceil(K*16) = 126, ceil(K*8) = 63, limit floors at 2.
+    v = decompose_variance({"q1": [-4.0, 4.0], "q2": [-3.0, 5.0], "q3": [-2.0, 6.0]}, mean_diff=1.0)
+    assert v.var_item_mean == 1.0
+    assert v.var_within == 32.0
+    assert v.var_between == 0.0
+    assert v.share_between == 0.0
+    assert v.n_required_items_current == 126
+    assert v.n_required_items_double == 63
+    assert v.n_required_items_limit == 2
+    assert v.recommendation == "more_samples_per_item"
+
+
+def test_decompose_zero_within_variance():
+    v = decompose_variance({"q1": [0.0, 0.0], "q2": [1.0, 1.0], "q3": [2.0, 2.0]}, mean_diff=1.0)
+    assert v.var_within == 0.0
+    assert v.var_between == 1.0
+    assert v.share_between == 1.0
+    assert v.n_required_items_current == 8  # ceil(K*1)
+    assert v.n_required_items_limit == 8
+    assert v.recommendation == "more_items"
+
+
+def test_decompose_exact_tie_recommends_more_items():
+    # var_item_mean = 2, var_within = 2, var_between = 1 -> noise share equals
+    # item share exactly; replicates can never shrink var_between, so items win.
+    v = decompose_variance({"q1": [-1.0, 1.0], "q2": [1.0, 3.0]}, mean_diff=1.0)
+    assert v.var_between == 1.0
+    assert v.var_within == 2.0
+    assert v.share_between == 0.5
+    assert v.recommendation == "more_items"
+
+
+def test_decompose_unbalanced_uses_pooled_ms_and_harmonic_mean():
+    # Pooled SS/df = (2 + 2 + 8) / (1 + 1 + 2) = 3.0 exactly — the naive mean of
+    # per-item variances would give 8/3. Harmonic mean_replicates = 1/mean(1/r_i)
+    # = 1/((1/2 + 1/2 + 1/3)/3) = 2.25; var_between = 183/9 - 3*(4/9) = 19.
+    v = decompose_variance(
+        {"q1": [0.0, 2.0], "q2": [4.0, 6.0], "q3": [8.0, 10.0, 12.0]}, mean_diff=16 / 3
+    )
+    assert v.var_within == 3.0
+    assert v.mean_replicates == pytest.approx(2.25, abs=1e-12)
+    assert v.var_between == pytest.approx(19.0, abs=1e-9)
+    assert v.n_items == 3
+    assert v.n_items_with_replicates == 3
+
+
+def test_decompose_none_when_not_separable():
+    # No item with >= 2 replicates (n_samples=1) or fewer than 2 items.
+    assert decompose_variance({"q1": [1.0], "q2": [2.0]}, mean_diff=1.0) is None
+    assert decompose_variance({"q1": [1.0, 2.0, 3.0]}, mean_diff=2.0) is None
+
+
+def test_decompose_invalid_diffs_rejected():
+    with pytest.raises(ValueError, match="empty"):
+        decompose_variance({"q1": [], "q2": [1.0, 2.0]}, mean_diff=1.0)
+    with pytest.raises(ValueError, match="finite"):
+        decompose_variance({"q1": [float("nan"), 1.0], "q2": [1.0, 2.0]}, mean_diff=1.0)
+
+
+def test_decompose_recovers_known_variance_ratio():
+    # d_ir = 0.4 + b_i + e_ir with sigma_b^2 = 0.36, sigma_e^2 = 1.0, n = 400,
+    # r = 4. Data seed 0 pre-screened: realized var_between 0.3587, var_within
+    # 0.9941, var_item_mean 0.6072. The parameters are chosen so that forgetting
+    # to subtract var_within/r returns var_item_mean (0.6072), which misses the
+    # var_between bound by 3x. Never change the seed to make an assertion pass.
+    rng = np.random.default_rng(0)
+    b = rng.normal(0.0, 0.6, 400)
+    e = rng.normal(0.0, 1.0, (400, 4))
+    d = 0.4 + b[:, None] + e
+    v = decompose_variance(
+        {f"q{i:03d}": tuple(row) for i, row in enumerate(d)}, mean_diff=float(d.mean())
+    )
+    assert abs(v.var_between - 0.36) < 0.08
+    assert abs(v.var_within - 1.0) < 0.05
+    assert v.var_item_mean > 0.55
+
+
+def test_decompose_required_current_matches_m3_power_estimator():
+    # At the observed harmonic mean replicates, the planner degenerates to the M3
+    # estimator over per-item means: sd^2 = var_between + var_within/r exactly on
+    # balanced data (126 here, well away from a ceil boundary at 125.58).
+    v = decompose_variance({"q1": [-4.0, -2.0], "q2": [0.0, 2.0], "q3": [4.0, 6.0]}, mean_diff=1.0)
+    assert v.n_required_items_current == required_items_for_power([-3.0, 1.0, 5.0]) == 126
+
+
+def test_position_swap_is_not_a_replicate(store):
+    # THE trap: pairwise n_samples=1 judged in both orders yields TWO judgment
+    # rows but ONE replicate index -> decomposition must be None. A row-naive
+    # implementation would report r = 2 and pass off position-flip disagreement
+    # as sampling noise.
+    run_id, cond = make_run(store)
+    c_sid = add_ok_sample(store, run_id, cond["control"], "q1")
+    t_sid = add_ok_sample(store, run_id, cond["treatment"], "q1")
+    c2 = add_ok_sample(store, run_id, cond["control"], "q2")
+    t2 = add_ok_sample(store, run_id, cond["treatment"], "q2")
+    for item, c, t in (("q1", c_sid, t_sid), ("q2", c2, t2)):
+        add_pair_judgment(
+            store, run_id, item, order="ab", verdict="A", control_sid=c, treatment_sid=t
+        )
+        add_pair_judgment(
+            store, run_id, item, order="ba", verdict="B", control_sid=c, treatment_sid=t
+        )
+    table = pairwise_replicate_scores(*tables(store, run_id))
+    assert set(table.scores["control"]["q1"]) == {0}  # one replicate, two orders
+    diffs = replicate_diffs(table, "control", "treatment")
+    assert decompose_variance(diffs, mean_diff=-1.0) is None
+
+
+# --- M7: run-level score variance shares (rubric) ---------------------------------
+
+
+def _shares_table(scores):
+    return ReplicateTable(scores=scores, n_judgments_used=0, n_judgments_errored=0)
+
+
+def test_score_variance_shares_hand_computed_additive():
+    # 2 conditions x 3 items x 2 replicates, additive cell means with constant
+    # within-cell spread: MS_C = 6, MS_I = 8, MS_res = 0, pooled var_e = 2.
+    # var_cond = 6/3 = 2, var_item = 8/2 = 4, var_noise = 0 + 2 = 2 -> shares
+    # (0.25, 0.5, 0.25). All dyadic: exact ==.
+    v = score_variance_shares(
+        _shares_table(
+            {
+                "control": {"q1": {0: 1.0, 1: 3.0}, "q2": {0: 3.0, 1: 5.0}, "q3": {0: 5.0, 1: 7.0}},
+                "treatment": {
+                    "q1": {0: 3.0, 1: 5.0},
+                    "q2": {0: 5.0, 1: 7.0},
+                    "q3": {0: 7.0, 1: 9.0},
+                },
+            }
+        )
+    )
+    assert v.n_conditions == 2
+    assert v.n_items == 3
+    assert v.mean_replicates == 2.0
+    assert v.var_condition == 2.0
+    assert v.var_item == 4.0
+    assert v.var_noise == 2.0
+    assert (v.share_condition, v.share_item, v.share_noise) == (0.25, 0.5, 0.25)
+
+
+def test_score_variance_shares_single_replicate_noise_is_residual():
+    # r = 1: replicate noise and interaction are confounded; noise = MS_res.
+    # Cells [[0, 2], [2, 6]]: MS_C = MS_I = 9, MS_res = 1 -> cond = item = 4,
+    # noise = 1 -> shares (4/9, 4/9, 1/9).
+    v = score_variance_shares(
+        _shares_table(
+            {
+                "control": {"q1": {0: 0.0}, "q2": {0: 2.0}},
+                "treatment": {"q1": {0: 2.0}, "q2": {0: 6.0}},
+            }
+        )
+    )
+    assert v.mean_replicates == 1.0
+    assert v.var_condition == 4.0
+    assert v.var_item == 4.0
+    assert v.var_noise == 1.0
+    assert v.share_condition == pytest.approx(4 / 9, abs=1e-12)
+    assert v.share_noise == pytest.approx(1 / 9, abs=1e-12)
+
+
+def test_score_variance_shares_incomplete_items_dropped():
+    # q3 exists only for control -> complete-case: identical result without it.
+    base = {
+        "control": {"q1": {0: 1.0, 1: 3.0}, "q2": {0: 3.0, 1: 5.0}},
+        "treatment": {"q1": {0: 3.0, 1: 5.0}, "q2": {0: 5.0, 1: 7.0}},
+    }
+    with_extra = {
+        "control": {**base["control"], "q3": {0: 9.0}},
+        "treatment": dict(base["treatment"]),
+    }
+    v = score_variance_shares(_shares_table(with_extra))
+    assert v == score_variance_shares(_shares_table(base))
+    assert v.n_items == 2
+
+
+def test_score_variance_shares_none_when_degenerate():
+    assert score_variance_shares(_shares_table({"only": {"q1": {0: 1.0}, "q2": {0: 2.0}}})) is None
+    assert (
+        score_variance_shares(
+            _shares_table({"a": {"q1": {0: 1.0}}, "b": {"q1": {0: 2.0}}})
+        )
+        is None
+    )
+
+
+def test_score_variance_shares_recovers_known_components():
+    # s_cir = 5 + a_c + b_i + e_cir, gamma = 0; C = 5, I = 200, r = 3;
+    # sigma_a = 0.8, sigma_b = 0.5, sigma_e = 1.0. The oracle is the REALIZED
+    # component variances (ddof=1 over the drawn effects), not the population
+    # values: data seed 1 pre-screened -> recovered vs realized gaps 0.012
+    # (condition), 0.021 (item), 0.017 (noise vs 1.0). Never change the seed to
+    # make an assertion pass.
+    rng = np.random.default_rng(1)
+    conditions, items, reps = 5, 200, 3
+    a = rng.normal(0.0, 0.8, conditions)
+    b = rng.normal(0.0, 0.5, items)
+    e = rng.normal(0.0, 1.0, (conditions, items, reps))
+    s = 5.0 + a[:, None, None] + b[None, :, None] + e
+    scores = {
+        f"c{ci}": {f"q{i:03d}": dict(enumerate(s[ci, i].tolist())) for i in range(items)}
+        for ci in range(conditions)
+    }
+    v = score_variance_shares(_shares_table(scores))
+    assert abs(v.var_condition - float(np.var(a, ddof=1))) < 0.08
+    assert abs(v.var_item - float(np.var(b, ddof=1))) < 0.08
+    assert abs(v.var_noise - 1.0) < 0.05
+
+
+# --- M7: analyze_run wiring — correction family + decomposition -------------------
+
+
+_MULTIARM_SCORES = {
+    "a": {"q1": 2.0, "q2": 4.0, "q3": 3.0},
+    "b": {"q1": 5.0, "q2": 7.0, "q3": 6.0},
+    "c": {"q1": 9.0, "q2": 3.0, "q3": 5.0},
+    "d": {"q1": 1.0, "q2": 8.0, "q3": 2.0},
+    "e": {"q1": 6.0, "q2": 6.0, "q3": 9.0},
+}
+
+
+def seed_rubric_multiarm(store, variant_scores):
+    run_id, cond = make_run(store, mode="rubric", variants=tuple(variant_scores))
+    for name, per_item in variant_scores.items():
+        for item, score in per_item.items():
+            sid = add_ok_sample(store, run_id, cond[name], item)
+            add_rubric_judgment(store, run_id, item, sample_id=sid, score=score)
+    return run_id
+
+
+def seed_rubric_replicated(store):
+    """Control 5.0 on both replicates of every item; treatment q1 (1,3), q2 (5,7),
+    q3 (9,11) — the replicate diffs are exactly the item-dominated hand case."""
+    run_id, cond = make_run(store, mode="rubric")
+    treatment_scores = {"q1": (1, 3), "q2": (5, 7), "q3": (9, 11)}
+    for item, scores in treatment_scores.items():
+        for index in (0, 1):
+            sid = add_ok_sample(store, run_id, cond["control"], item, sample_index=index)
+            add_rubric_judgment(store, run_id, item, sample_id=sid, score=5)
+        for index, score in enumerate(scores):
+            sid = add_ok_sample(store, run_id, cond["treatment"], item, sample_index=index)
+            add_rubric_judgment(store, run_id, item, sample_id=sid, score=score)
+    return run_id
+
+
+def test_analyze_run_family_of_one_correction_is_identity(store):
+    run_id = make_scored_pairwise_run(store)
+    result = analyze_run(store, run_id)
+    comparison = result.comparisons[0]
+    assert comparison.n_comparisons == 1
+    assert comparison.p_value_corrected == comparison.p_value
+    assert comparison.correction_method == DEFAULT_CORRECTION == "holm"
+    assert result.correction_method == "holm"
+
+
+def test_analyze_run_multiarm_correction_matches_pure_function(store):
+    run_id = seed_rubric_multiarm(store, _MULTIARM_SCORES)
+    result = analyze_run(store, run_id)
+    assert len(result.comparisons) == 10  # C(5,2)
+    assert all(c.n_comparisons == 10 for c in result.comparisons)
+    raw = tuple(c.p_value for c in result.comparisons)
+    corrected = tuple(c.p_value_corrected for c in result.comparisons)
+    assert corrected == holm_bonferroni(raw)
+    assert all(q >= p for p, q in zip(raw, corrected, strict=True))
+    assert result.correction_method == "holm"
+    pairs = [(c.variant_a, c.variant_b) for c in result.comparisons]
+    assert pairs[:3] == [("a", "b"), ("a", "c"), ("a", "d")]  # declared-pair order kept
+
+
+def test_analyze_run_correction_bh_selectable(store):
+    run_id = seed_rubric_multiarm(store, _MULTIARM_SCORES)
+    result = analyze_run(store, run_id, correction="bh")
+    raw = tuple(c.p_value for c in result.comparisons)
+    assert tuple(c.p_value_corrected for c in result.comparisons) == benjamini_hochberg(raw)
+    assert result.correction_method == "bh"
+
+
+def test_analyze_run_unknown_correction_rejected(store):
+    run_id = make_scored_pairwise_run(store)
+    with pytest.raises(ValueError, match="correction"):
+        analyze_run(store, run_id, correction="bonferroni")
+
+
+def test_analyze_run_populates_variance_decomposition(store):
+    run_id = seed_rubric_replicated(store)
+    comparison = analyze_run(store, run_id).comparisons[0]
+    assert comparison.mean_diff == 1.0
+    v = comparison.variance
+    assert v is not None
+    assert v.var_between == 15.0
+    assert v.var_within == 2.0
+    assert v.mean_replicates == 2.0
+    assert v.n_required_items_current == 126
+    assert v.recommendation == "more_items"
+
+
+def test_analyze_run_single_replicate_variance_none_shares_defined(store):
+    # n_samples = 1: the diff-scale decomposition needs replicates (None), but the
+    # r=1 shares table is still defined (interaction + noise confounded).
+    run_id, cond = make_run(store, mode="rubric")
+    for item, (c_score, t_score) in (("q1", (2, 5)), ("q2", (4, 7))):
+        sid = add_ok_sample(store, run_id, cond["control"], item)
+        add_rubric_judgment(store, run_id, item, sample_id=sid, score=c_score)
+        sid = add_ok_sample(store, run_id, cond["treatment"], item)
+        add_rubric_judgment(store, run_id, item, sample_id=sid, score=t_score)
+    result = analyze_run(store, run_id)
+    assert result.comparisons[0].variance is None
+    assert result.score_variance is not None
+
+
+def test_analyze_run_rubric_score_variance_hand_computed(store):
+    # Cell means [[5,5,5],[2,6,10]]: ms_cond 1.5, ms_item 8, ms_res 8. Within-cell
+    # ss: control cells are constant (0 each), treatment cells (1,3)/(5,7)/(9,11)
+    # contribute 2 each -> pooled var_e = 6/6 = 1; var_gamma = 8 - 1*0.5 = 7.5,
+    # noise = 8.5; condition and item components clamp to 0: this fixture is
+    # interaction-dominated by construction.
+    shares = analyze_run(store, seed_rubric_replicated(store)).score_variance
+    assert shares is not None
+    assert (shares.var_condition, shares.var_item, shares.var_noise) == (0.0, 0.0, 8.5)
+    assert shares.share_noise == 1.0
+
+
+def test_analyze_run_pairwise_score_variance_is_none(store):
+    # Pairwise scores are complementary (B = 1 - A): the 3-way split degenerates.
+    result = analyze_run(store, make_scored_pairwise_run(store))
+    assert result.score_variance is None
+
+
+def test_analyze_run_determinism_with_replicates_and_correction(store):
+    # Extends the M3 determinism pin to the nested VarianceDecomposition /
+    # ScoreVarianceShares dataclasses and the correction pass.
+    run_id = seed_rubric_replicated(store)
+    assert analyze_run(store, run_id) == analyze_run(store, run_id)

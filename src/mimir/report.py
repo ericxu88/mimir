@@ -103,6 +103,44 @@ def _fmt(value: float | None, spec: str = ".3f") -> str:
     return "n/a" if value is None else format(value, spec)
 
 
+# Display names are the renderer's business; .get fallback so a future method
+# can never KeyError a report.
+_CORRECTION_LABELS = {"bh": "Benjamini-Hochberg FDR", "holm": "Holm-Bonferroni"}
+
+
+def _p_value_text(c: Comparison, *, html: bool = False) -> str:
+    # M7 mandate: a multi-arm family NEVER renders the raw p — corrected only.
+    if c.n_comparisons > 1 and c.p_value_corrected is not None:
+        family = f", {c.n_comparisons} comparisons" if html else ""
+        return (
+            f"{c.p_value_corrected:.4f} ({c.correction_method}-corrected{family},"
+            f" {c.p_method}, {c.n_permutations} permutations)"
+        )
+    return f"{c.p_value:.4f} ({c.p_method}, {c.n_permutations} permutations)"
+
+
+def _allocation_text(c: Comparison) -> tuple[str, str] | None:
+    v = c.variance
+    if v is None:
+        return None
+    split = (
+        f"item {v.var_between:.3f}, sampling {v.var_within:.3f}"
+        f" ({v.mean_replicates:.1f} samples per item)"
+    )
+    if v.recommendation == "more_samples_per_item":
+        phrase = "more samples per item"
+    else:
+        phrase = "more items"
+    if v.n_required_items_double is None:
+        detail = "items needed not estimable"
+    else:
+        detail = (
+            f"{v.n_required_items_double} items at {2 * v.mean_replicates:.1f} samples,"
+            f" {v.n_required_items_limit} at unlimited"
+        )
+    return split, f"{phrase} ({detail})"
+
+
 def _score_axis(mode: str) -> tuple[float, float, int]:
     # Pairwise per-item scores live in [0, 1]; rubric scores in [1, 10].
     if mode == "rubric":
@@ -124,16 +162,22 @@ def _comparison_lines(c: Comparison) -> list[str]:
             f"{c.n_required_items} items needed for {round(c.target_power * 100)}% power"
             f" ({c.n_additional_items} more than paired)"
         )
-    return [
+    lines = [
         f"{c.variant_b} vs {c.variant_a} (diff = {c.variant_b} - {c.variant_a})",
         row("paired items:", f"{c.n_items} ({c.n_items_dropped} dropped)"),
         row(f"mean {c.variant_a}:", _fmt(c.mean_a)),
         row(f"mean {c.variant_b}:", _fmt(c.mean_b)),
         row("mean diff:", _fmt(c.mean_diff)),
         row(f"{round(c.ci_level * 100)}% CI:", f"[{_fmt(c.ci_low)}, {_fmt(c.ci_high)}]"),
-        row("p-value:", f"{c.p_value:.4f} ({c.p_method}, {c.n_permutations} permutations)"),
+        row("p-value:", _p_value_text(c)),
         row("power:", power),
     ]
+    allocation = _allocation_text(c)
+    if allocation is not None:
+        split, advice = allocation
+        lines.append(row("variance split:", split))
+        lines.append(row("allocation:", advice))
+    return lines
 
 
 def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -> str:
@@ -155,6 +199,20 @@ def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -
         else:
             detail = "no scores"
         lines.append(f"  {variant:<18}{detail}")
+    shares = result.score_variance
+    if shares is not None:
+        lines.append("")
+        lines.append(
+            f"  {'variance shares:':<18}condition {shares.share_condition:.1%},"
+            f" item {shares.share_item:.1%}, noise {shares.share_noise:.1%}"
+        )
+    if len(result.comparisons) > 1 and result.correction_method is not None:
+        label = _CORRECTION_LABELS.get(result.correction_method, result.correction_method)
+        lines.append("")
+        lines.append(
+            f"multiple comparisons: {len(result.comparisons)} pairs,"
+            f" p-values corrected ({label}); CIs are uncorrected"
+        )
     for comparison in result.comparisons:
         lines.append("")
         lines.extend(_comparison_lines(comparison))
@@ -292,20 +350,30 @@ def _comparison_html(c: Comparison) -> str:
             f"{c.n_required_items} items for {round(c.target_power * 100)}% power"
             f" ({c.n_additional_items} more than paired)"
         )
-    rows = (
+    rows = [
         (f"mean {_esc(c.variant_a)}", _fmt(c.mean_a)),
         (f"mean {_esc(c.variant_b)}", _fmt(c.mean_b)),
         ("mean diff", _fmt(c.mean_diff)),
         (f"{round(c.ci_level * 100)}% CI", f"[{_fmt(c.ci_low)}, {_fmt(c.ci_high)}]"),
-        ("p-value", f"{c.p_value:.4f} ({_esc(c.p_method)}, {c.n_permutations} permutations)"),
+        ("p-value", _p_value_text(c, html=True)),
         ("paired items", f"{c.n_items} ({c.n_items_dropped} dropped)"),
         ("power", power),
-    )
+    ]
+    allocation = _allocation_text(c)
+    if allocation is not None:
+        v = c.variance
+        rows.append(("variance (item)", f"{v.var_between:.3f}"))
+        rows.append(("variance (sampling)", f"{v.var_within:.3f}"))
+        rows.append(("samples per item", f"{v.mean_replicates:.1f}"))
+        rows.append(("allocation", _esc(allocation[1])))
     cells = "".join(f"<tr><th>{label}</th><td>{value}</td></tr>" for label, value in rows)
-    verdict = "yes" if c.p_value < c.alpha else "no"
+    corrected = c.n_comparisons > 1 and c.p_value_corrected is not None
+    p_shown = c.p_value_corrected if corrected else c.p_value
+    suffix = f" after {_esc(c.correction_method)} correction" if corrected else ""
+    verdict = "yes" if p_shown < c.alpha else "no"
     return (
         f"<h3>{_esc(c.variant_b)} vs {_esc(c.variant_a)}</h3><table>{cells}</table>"
-        f"<p>significant at alpha={c.alpha:g}: {verdict}</p>"
+        f"<p>significant at alpha={c.alpha:g}{suffix}: {verdict}</p>"
     )
 
 
@@ -353,8 +421,23 @@ def render_html(
             f'<p class="warn">warning: run status is {_esc(status)};'
             " this report reflects partial data</p>"
         )
+    shares = result.score_variance
+    shares_html = ""
+    if shares is not None:
+        shares_html = (
+            f'<p class="muted">variance shares: condition {shares.share_condition:.1%},'
+            f" item {shares.share_item:.1%}, noise {shares.share_noise:.1%}</p>"
+        )
+    family = ""
+    if len(result.comparisons) > 1 and result.correction_method is not None:
+        label = _CORRECTION_LABELS.get(result.correction_method, result.correction_method)
+        family = (
+            f'<p class="muted">multiple comparisons: {len(result.comparisons)} pairs,'
+            f" p-values corrected ({_esc(label)}); CIs are uncorrected</p>"
+        )
     comparisons = (
         "<section><h2>comparisons</h2>"
+        + family
         + "".join(_comparison_html(c) for c in result.comparisons)
         + "</section>"
     )
@@ -365,7 +448,7 @@ def render_html(
         '<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{title}</title><style>{_STYLE}</style></head><body><main>"
-        f"{header}{warning}{_summary_html(result)}{_distributions_html(result)}"
+        f"{header}{warning}{_summary_html(result)}{shares_html}{_distributions_html(result)}"
         f"{comparisons}{judge}"
         "</main></body></html>"
     )

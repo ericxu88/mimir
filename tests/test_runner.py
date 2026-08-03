@@ -506,6 +506,66 @@ async def test_raising_n_samples_reuses_replicates_and_executes_only_the_delta(s
 
 
 @pytest.mark.anyio
+async def test_crn_replicate_seed_set_identical_across_variants_and_items(store):
+    # CRN contract (M7): replicate r of EVERY (variant, item) cell carries seed
+    # sampling.seed + r — request.seed alone is the replicate's random-state
+    # identifier, shared across conditions so a seed-honoring client draws common
+    # noise. Literal seed sets (not sampling.seed + i) pin the derivation itself.
+    spec = make_spec(n_samples=3, sampling={"model": "claude-haiku-4-5-20251001", "seed": 7})
+    client = MockClient()
+    await run_experiment(spec, store, client)
+    assert len(client.calls) == 12  # 2 variants x 2 items x 3 replicates
+    cells: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    for request in client.calls:
+        cells.setdefault((request.system, request.user), []).append(
+            (request.seed, request.sample_index)
+        )
+    assert len(cells) == 4  # 2 variants x 2 items
+    for pairs in cells.values():
+        assert sorted(pairs) == [(7, 0), (8, 1), (9, 2)]
+
+
+@pytest.mark.anyio
+async def test_replicate_zero_seed_unchanged_so_pre_crn_cache_entries_hit(store):
+    # Back-compat: at sample_index 0 the payload seed IS sampling.seed, so cache
+    # entries written before the CRN derivation keep hitting for replicate 0.
+    spec = make_spec(
+        variants=[{"name": "control", "system": "s", "user_template": "Answer: {input}"}],
+        items=[{"id": "q1", "input": "only one"}],
+        n_samples=2,
+        sampling={"model": "claude-haiku-4-5-20251001", "seed": 7},
+    )
+    pre_crn_key = cache_key(
+        build_payload(
+            model="claude-haiku-4-5-20251001",
+            system="s",
+            user="Answer: only one",
+            temperature=1.0,
+            max_tokens=1024,
+            seed=7,
+            sample_index=0,
+        )
+    )
+    envelope = {
+        "text": "cached",
+        "raw": {},
+        "input_tokens": 1,
+        "output_tokens": 1,
+        "latency_ms": 1.0,
+        "model": "m",
+    }
+    store.cache_put(pre_crn_key, envelope)
+    client = MockClient()
+    run_id = await run_experiment(spec, store, client)
+    (request,) = client.calls  # replicate 0 was served from the pre-CRN cache entry
+    assert (request.seed, request.sample_index) == (8, 1)
+    rows = {row["sample_index"]: row for row in store.get_samples(run_id)}
+    assert rows[0]["cache_hit"] == 1
+    assert rows[0]["response_text"] == "cached"
+    assert rows[1]["cache_hit"] == 0
+
+
+@pytest.mark.anyio
 async def test_pairwise_judge_pairs_replicate_i_with_replicate_i(store):
     spec = make_spec(n_samples=2, judge={"model": "judge-model", "mode": "pairwise"})
     client = MockClient()

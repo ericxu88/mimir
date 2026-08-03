@@ -216,7 +216,10 @@ async def _execute_run(
                 user=variant.user_template.format(**_item_fields(item)),
                 temperature=spec.sampling.temperature,
                 max_tokens=spec.sampling.max_tokens,
-                seed=spec.sampling.seed,
+                # CRN (M7): one seed per replicate, shared across variants and
+                # items, so every condition faces the same labeled random states
+                # (DESIGN §3/§5). Index 0 still carries sampling.seed exactly.
+                seed=spec.sampling.seed + index,
                 sample_index=index,
             )
             key = cache_key(payload)

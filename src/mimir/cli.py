@@ -28,7 +28,7 @@ from mimir.judge_audit import audit_judge
 from mimir.report import render_analysis_text, render_audit_text, render_html
 from mimir.runner import run_experiment
 from mimir.spec import load_spec
-from mimir.stats import analyze_run
+from mimir.stats import CORRECTION_METHODS, DEFAULT_CORRECTION, analyze_run
 from mimir.store import Store
 
 _DB_HELP = "SQLite results database (default: %(default)s)"
@@ -114,7 +114,7 @@ def _html_path(args: argparse.Namespace, run_id: str) -> Path:
 def _cmd_analyze(args: argparse.Namespace) -> int:
     try:
         with _open_store(args.db) as store:
-            result = analyze_run(store, args.run_id)
+            result = analyze_run(store, args.run_id, correction=args.correction)
             status = store.get_run(args.run_id)["status"]
             card = None
             if args.html is not None:
@@ -171,6 +171,13 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze_p = sub.add_parser("analyze", help="statistical analysis of a stored run")
     analyze_p.add_argument("run_id")
     analyze_p.add_argument("--db", default="mimir.db", help=_DB_HELP)
+    analyze_p.add_argument(
+        "--correction",
+        choices=CORRECTION_METHODS,
+        default=DEFAULT_CORRECTION,
+        help="multiple-comparison correction across the run's variant pairs"
+        " (default: %(default)s; no effect on a 2-variant run)",
+    )
     analyze_p.add_argument(
         "--html",
         nargs="?",

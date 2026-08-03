@@ -16,7 +16,7 @@ from mimir.report import (
     render_html,
     svg_histogram,
 )
-from mimir.stats import AnalysisResult, Comparison
+from mimir.stats import AnalysisResult, Comparison, ScoreVarianceShares, VarianceDecomposition
 
 
 def make_comparison(**overrides):
@@ -368,3 +368,129 @@ def test_render_html_ninth_variant_falls_back_to_muted():
     out = render_html(make_result(scores=scores))
     assert "var(--series-8)" in out
     assert "var(--muted)" in out
+
+
+# --- M7: corrected p-values, variance decomposition, score shares -----------------
+
+
+def make_decomposition(**overrides):
+    fields = {
+        "n_items": 3,
+        "n_items_with_replicates": 3,
+        "mean_replicates": 2.0,
+        "var_between": 0.0,
+        "var_within": 32.0,
+        "var_item_mean": 16.0,
+        "share_between": 0.0,
+        "n_required_items_current": 126,
+        "n_required_items_double": 63,
+        "n_required_items_limit": 2,
+        "recommendation": "more_samples_per_item",
+    }
+    fields.update(overrides)
+    return VarianceDecomposition(**fields)
+
+
+def make_shares(**overrides):
+    fields = {
+        "n_conditions": 2,
+        "n_items": 3,
+        "mean_replicates": 2.0,
+        "var_condition": 2.0,
+        "var_item": 4.0,
+        "var_noise": 2.0,
+        "share_condition": 0.25,
+        "share_item": 0.5,
+        "share_noise": 0.25,
+    }
+    fields.update(overrides)
+    return ScoreVarianceShares(**fields)
+
+
+def multiarm_comparisons(p_value=0.01, p_value_corrected=0.06):
+    return [
+        make_comparison(
+            p_value=p_value,
+            p_value_corrected=p_value_corrected,
+            correction_method="holm",
+            n_comparisons=3,
+        )
+        for _ in range(3)
+    ]
+
+
+def test_corrected_p_replaces_raw_for_multiarm():
+    text = render_analysis_text(
+        make_result(comparisons=multiarm_comparisons(), correction_method="holm")
+    )
+    assert "p-value:          0.0600 (holm-corrected, exhaustive, 16 permutations)" in text
+    assert "0.0100" not in text  # the raw p is never rendered for a multi-arm family
+
+
+def test_family_line_present_only_for_multiarm():
+    multi = render_analysis_text(
+        make_result(comparisons=multiarm_comparisons(), correction_method="holm")
+    )
+    assert (
+        "multiple comparisons: 3 pairs, p-values corrected (Holm-Bonferroni);"
+        " CIs are uncorrected" in multi
+    )
+    single = render_analysis_text(make_result(correction_method="holm"))
+    assert "multiple comparisons" not in single
+
+
+def test_variance_rows_rendered_when_present():
+    text = render_analysis_text(
+        make_result(comparisons=[make_comparison(variance=make_decomposition())])
+    )
+    assert "  variance split:   item 0.000, sampling 32.000 (2.0 samples per item)" in text
+    assert (
+        "  allocation:       more samples per item (63 items at 4.0 samples, 2 at unlimited)"
+        in text
+    )
+
+
+def test_allocation_not_estimable_branch():
+    comparison = make_comparison(
+        variance=make_decomposition(
+            n_required_items_current=None,
+            n_required_items_double=None,
+            n_required_items_limit=None,
+            recommendation="more_items",
+        )
+    )
+    text = render_analysis_text(make_result(comparisons=[comparison]))
+    assert "allocation:       more items (items needed not estimable)" in text
+
+
+def test_score_variance_shares_line_gated():
+    text = render_analysis_text(make_result(score_variance=make_shares(), mode="rubric"))
+    assert "variance shares:  condition 25.0%, item 50.0%, noise 25.0%" in text
+    assert "variance shares" not in render_analysis_text(make_result())
+
+
+def test_render_analysis_text_golden_still_byte_identical():
+    # The M5 golden is the regression gate for every M7 report change: a default
+    # single-comparison result renders EXACTLY as before.
+    assert render_analysis_text(make_result(), status="complete") == GOLDEN_ANALYSIS
+
+
+def test_render_html_verdict_uses_corrected_p():
+    out = render_html(make_result(comparisons=multiarm_comparisons(), correction_method="holm"))
+    assert "significant at alpha=0.05 after holm correction: no" in out
+    assert "0.0100" not in out
+    assert "0.0600 (holm-corrected, 3 comparisons, exhaustive, 16 permutations)" in out
+
+
+def test_render_html_variance_and_shares_rows_no_new_figures():
+    result = make_result(
+        comparisons=[make_comparison(variance=make_decomposition())],
+        score_variance=make_shares(),
+        mode="rubric",
+    )
+    out = render_html(result)
+    assert "<th>variance (item)</th><td>0.000</td>" in out
+    assert "<th>variance (sampling)</th><td>32.000</td>" in out
+    assert "<th>allocation</th>" in out
+    assert "variance shares: condition 25.0%, item 50.0%, noise 25.0%" in out
+    assert out.count("<figure") == 2  # no new figures, ever
