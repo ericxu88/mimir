@@ -7,6 +7,8 @@ only the delta.
 
 import asyncio
 import json
+import sqlite3
+import sys
 
 import pytest
 
@@ -14,6 +16,7 @@ import mimir.runner as runner_mod
 from mimir.cache import build_payload, cache_key
 from mimir.clients.base import CompletionResponse
 from mimir.clients.mock import MockClient
+from mimir.judge_audit import audit_judge
 from mimir.runner import (
     TokenBucket,
     parse_pairwise_verdict,
@@ -21,6 +24,7 @@ from mimir.runner import (
     run_experiment,
 )
 from mimir.spec import ExperimentSpec
+from mimir.stats import analyze_run
 from mimir.store import Store
 
 
@@ -1140,3 +1144,300 @@ async def test_retry_after_is_capped_at_max_delay(store, monkeypatch):
     run_id = await run_experiment(spec, store, client)
     assert store.get_run(run_id)["status"] == "complete"
     assert sleeps == [0.02]
+
+
+# --- M10: non-LLM conditions and the parse_float scorer through the runner ---------
+
+# Deterministic seeded "benchmark": prints base + seed/10 (base and marker differ
+# per variant so the two arms never share a cache key). Appends one char to the
+# marker file per EXECUTION, so cache hits are observable as an unchanged marker.
+_BENCH_CODE = (
+    "import sys, pathlib\n"
+    "pathlib.Path(sys.argv[3]).open('a').write('x')\n"
+    "print('case ' + sys.argv[4])\n"
+    "print(float(sys.argv[1]) + int(sys.argv[2]) / 10)\n"
+)
+
+
+def command_variant(name, base, marker, extra=None):
+    argv = [sys.executable, "-c", _BENCH_CODE, str(base), "{seed}", str(marker), "{input}"]
+    variant = {"type": "command", "name": name, "command": argv}
+    if extra:
+        variant.update(extra)
+    return variant
+
+
+def make_command_spec(tmp_path, *, n_samples=1, judge=None, items=None, seed=0):
+    marker_a = tmp_path / "marker_a"
+    marker_b = tmp_path / "marker_b"
+    data = {
+        "name": "bench",
+        "variants": [
+            command_variant("fast", 5.0, marker_a),
+            command_variant("slow", 2.0, marker_b),
+        ],
+        "dataset": {
+            "items": items
+            or [
+                {"id": "q1", "input": "alpha"},
+                {"id": "q2", "input": "beta"},
+            ]
+        },
+        "sampling": {"seed": seed},
+        "n_samples": n_samples,
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    if judge is not None:
+        data["judge"] = judge
+    return ExperimentSpec.model_validate(data), marker_a, marker_b
+
+
+def executions(marker):
+    return len(marker.read_text()) if marker.exists() else 0
+
+
+def runner_bench_fn(item, seed):
+    return f"py:{item['id']}:{seed}\n{seed + 1.5}"
+
+
+@pytest.mark.anyio
+async def test_command_run_end_to_end_records_samples(store, tmp_path):
+    spec, _, _ = make_command_spec(tmp_path, n_samples=2)
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "complete"
+    samples = store.get_samples(run_id)
+    assert len(samples) == 8  # 2 variants x 2 items x 2 replicates
+    assert all(row["error"] is None for row in samples)
+    assert all(row["input_tokens"] == 0 and row["output_tokens"] == 0 for row in samples)
+    names = condition_names(store, run_id)
+    fast_rows = [row for row in samples if names[row["condition_id"]] == "fast"]
+    # seed 0 replicate 0 -> 5.0 + 0/10; replicate 1 -> 5.0 + 1/10
+    texts = {row["response_text"].splitlines()[-1] for row in fast_rows}
+    assert texts == {"5.0", "5.1"}
+    raw = json.loads(fast_rows[0]["raw_response"])
+    assert raw["returncode"] == 0
+    assert raw["argv"][0] == sys.executable
+    # Provenance mapping for the NOT NULL prompt columns (analysis never reads them).
+    conditions = store.get_conditions(run_id)
+    assert all(row["system_prompt"] == "" for row in conditions)
+    assert json.loads(conditions[0]["user_template"])[0] == sys.executable
+
+
+@pytest.mark.anyio
+async def test_command_rerun_hits_cache_and_skips_execution(store, tmp_path):
+    spec, marker_a, marker_b = make_command_spec(tmp_path, n_samples=2)
+    first_run = await run_experiment(spec, store, None)
+    executed = executions(marker_a) + executions(marker_b)
+    assert executed == 8
+    second_run = await run_experiment(spec, store, None)
+    assert executions(marker_a) + executions(marker_b) == executed  # zero new launches
+    second_samples = store.get_samples(second_run)
+    assert all(row["cache_hit"] == 1 for row in second_samples)
+    first_texts = {r["response_text"] for r in store.get_samples(first_run)}
+    assert {r["response_text"] for r in second_samples} == first_texts
+
+
+@pytest.mark.anyio
+async def test_command_crn_replicate_seeds_flow_into_argv(store, tmp_path):
+    spec, _, _ = make_command_spec(tmp_path, n_samples=3, seed=7)
+    run_id = await run_experiment(spec, store, None)
+    coordinates = set()
+    for row in store.get_samples(run_id):
+        payload = json.loads(row["request_json"])
+        coordinates.add((int(payload["argv"][4]), payload["sample_index"]))
+    # The M7 CRN contract, generalized: same literal seed set for every condition.
+    assert coordinates == {(7, 0), (8, 1), (9, 2)}
+
+
+@pytest.mark.anyio
+async def test_command_failure_records_error_row_and_fails_run(store, tmp_path):
+    spec, _, _ = make_command_spec(tmp_path)
+    failing = {
+        "type": "command",
+        "name": "slow",
+        "command": [sys.executable, "-c", "import sys; sys.stderr.write('kaput'); sys.exit(2)"],
+    }
+    data = spec.model_dump()
+    data["variants"][1] = failing
+    spec = ExperimentSpec.model_validate(data)
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "failed"
+    names = condition_names(store, run_id)
+    by_variant = {}
+    for row in store.get_samples(run_id):
+        by_variant.setdefault(names[row["condition_id"]], []).append(row)
+    assert all(row["error"] is None for row in by_variant["fast"])
+    for row in by_variant["slow"]:
+        assert "ConditionError" in row["error"]
+        assert "2" in row["error"]
+        assert "kaput" in row["error"]
+
+
+@pytest.mark.anyio
+async def test_command_timeout_records_error_row_without_retry(store, tmp_path):
+    marker = tmp_path / "marker_t"
+    code = (
+        "import sys, pathlib, time\n"
+        f"pathlib.Path({str(marker)!r}).open('a').write('x')\n"
+        "time.sleep(60)\n"
+    )
+    data = {
+        "name": "bench",
+        "variants": [
+            {
+                "type": "command",
+                "name": "sleepy",
+                "command": [sys.executable, "-c", code],
+                "timeout_s": 0.3,
+            }
+        ],
+        "dataset": {"items": [{"id": "q1", "input": "alpha"}]},
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    spec = ExperimentSpec.model_validate(data)
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "failed"
+    [row] = store.get_samples(run_id)
+    assert "timed out" in row["error"]
+    assert executions(marker) == 1  # ConditionError is never retried
+
+
+@pytest.mark.anyio
+async def test_mixed_llm_and_command_variants_in_one_run(store, tmp_path):
+    marker = tmp_path / "marker_m"
+    data = {
+        "name": "mixed",
+        "variants": [
+            command_variant("bench", 3.0, marker),
+            {"name": "prompted", "system": "s", "user_template": "Answer: {input}"},
+        ],
+        "dataset": {"items": [{"id": "q1", "input": "alpha"}]},
+        "sampling": {"model": "claude-haiku-4-5-20251001"},
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    spec = ExperimentSpec.model_validate(data)
+    client = MockClient()
+    run_id = await run_experiment(spec, store, client)
+    assert store.get_run(run_id)["status"] == "complete"
+    names = condition_names(store, run_id)
+    texts = {names[r["condition_id"]]: r["response_text"] for r in store.get_samples(run_id)}
+    assert texts["bench"].splitlines()[-1] == "3.0"
+    assert texts["prompted"].startswith("mock:")
+    assert len(client.calls) == 1  # the command arm never touches the client
+
+
+@pytest.mark.anyio
+async def test_llm_judge_scores_command_outputs(store, tmp_path):
+    spec, _, _ = make_command_spec(
+        tmp_path,
+        judge={"model": "judge-model", "mode": "pairwise"},
+        items=[{"id": "q1", "input": "alpha"}],
+    )
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "A")
+    run_id = await run_experiment(spec, store, client)
+    assert store.get_run(run_id)["status"] == "complete"
+    judgments = store.get_judgments(run_id)
+    assert len(judgments) == 2  # both presentation orders
+    assert {row["verdict"] for row in judgments} == {"A"}
+    sample_ids = {row["id"] for row in store.get_samples(run_id)}
+    assert all(row["sample_a_id"] in sample_ids for row in judgments)
+
+
+@pytest.mark.anyio
+async def test_llm_spec_without_client_raises_before_any_run_row(tmp_path):
+    db_path = tmp_path / "mimir.db"
+    spec = make_spec()
+    with Store(db_path) as store, pytest.raises(ValueError, match="client"):
+        await run_experiment(spec, store, None)
+    with sqlite3.connect(db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+@pytest.mark.anyio
+async def test_python_condition_through_runner(store, tmp_path):
+    data = {
+        "name": "py-bench",
+        "variants": [{"type": "python", "name": "fn", "callable": "test_runner:runner_bench_fn"}],
+        "dataset": {"items": [{"id": "q1", "input": "alpha"}]},
+        "sampling": {"seed": 4},
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    spec = ExperimentSpec.model_validate(data)
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "complete"
+    [row] = store.get_samples(run_id)
+    assert row["response_text"] == "py:q1:4\n5.5"
+    rerun_id = await run_experiment(spec, store, None)
+    assert all(r["cache_hit"] == 1 for r in store.get_samples(rerun_id))
+
+
+@pytest.mark.anyio
+async def test_parse_float_scoring_writes_rubric_shaped_judgments(store, tmp_path):
+    spec, _, _ = make_command_spec(tmp_path, n_samples=2, judge={"type": "parse_float"})
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "complete"
+    judgments = store.get_judgments(run_id)
+    assert len(judgments) == 8  # one score per sample
+    sample_scores = {}
+    for row in judgments:
+        assert row["mode"] == "rubric"
+        assert row["judge_model"] == "parse_float"
+        assert row["cache_key"] == ""
+        assert row["verdict"] is None
+        assert row["sample_b_id"] is None
+        assert row["error"] is None
+        sample_scores[row["sample_a_id"]] = row["score"]
+    names = condition_names(store, run_id)
+    for sample in store.get_samples(run_id):
+        expected = float(sample["response_text"].splitlines()[-1])
+        assert sample_scores[sample["id"]] == expected
+        assert names[sample["condition_id"]] in ("fast", "slow")
+
+
+@pytest.mark.anyio
+async def test_parse_float_parse_failure_records_error_row(store, tmp_path):
+    data = {
+        "name": "bench",
+        "variants": [
+            {
+                "type": "command",
+                "name": "wordy",
+                "command": [sys.executable, "-c", "print('no score here')"],
+            }
+        ],
+        "dataset": {"items": [{"id": "q1", "input": "alpha"}]},
+        "judge": {"type": "parse_float"},
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    spec = ExperimentSpec.model_validate(data)
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "failed"
+    [judgment] = store.get_judgments(run_id)
+    assert judgment["score"] is None
+    assert "score" in judgment["error"]
+    [sample] = store.get_samples(run_id)
+    assert sample["error"] is None  # the sample succeeded; only scoring failed
+
+
+@pytest.mark.anyio
+async def test_parse_float_run_analyzes_with_untouched_stats(store, tmp_path):
+    # THE compatibility proof: a subprocess run flows through analyze_run
+    # (stats.py, zero M10 changes) as a rubric-shaped analysis, and audit_judge
+    # (judge_audit.py, zero M10 changes) refuses it with its existing error.
+    spec, _, _ = make_command_spec(tmp_path, judge={"type": "parse_float"})
+    run_id = await run_experiment(spec, store, None)
+    assert store.get_run(run_id)["status"] == "complete"
+    result = analyze_run(store, run_id)
+    assert result.mode == "rubric"
+    assert set(result.scores) == {"fast", "slow"}
+    # seed 0, replicate 0: fast prints 5.0, slow prints 2.0, for every item.
+    assert set(result.scores["fast"].values()) == {5.0}
+    assert set(result.scores["slow"].values()) == {2.0}
+    [comparison] = result.comparisons
+    assert (comparison.variant_a, comparison.variant_b) == ("fast", "slow")
+    assert comparison.mean_a == 5.0
+    assert comparison.mean_b == 2.0
+    assert comparison.mean_diff == -3.0
+    with pytest.raises(ValueError, match=r"mode|model"):
+        audit_judge(store, run_id)

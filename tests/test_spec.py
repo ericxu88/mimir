@@ -423,3 +423,224 @@ def test_judge_prompt_template_rejects_lone_surrogate():
     )
     with pytest.raises(ValidationError, match="lone surrogate"):
         ExperimentSpec.model_validate(data)
+
+
+# --- M10: condition/scorer type discriminators (llm | command | python) ------------
+
+
+def command_spec_dict(**overrides):
+    data = {
+        "name": "bench",
+        "variants": [
+            {
+                "type": "command",
+                "name": "fast",
+                "command": [
+                    "python3",
+                    "bench.py",
+                    "--algo",
+                    "fast",
+                    "--seed",
+                    "{seed}",
+                    "--case",
+                    "{input}",
+                ],
+            },
+            {
+                "type": "command",
+                "name": "slow",
+                "command": [
+                    "python3",
+                    "bench.py",
+                    "--algo",
+                    "slow",
+                    "--seed",
+                    "{seed}",
+                    "--case",
+                    "{input}",
+                ],
+            },
+        ],
+        "dataset": {
+            "items": [
+                {"id": "q1", "input": "alpha"},
+                {"id": "q2", "input": "beta"},
+            ]
+        },
+        "judge": {"type": "parse_float"},
+    }
+    data.update(overrides)
+    return data
+
+
+def test_untyped_variant_defaults_to_llm_type():
+    spec = ExperimentSpec.model_validate(spec_dict())
+    assert spec.variants[0].type == "llm"
+    assert spec.model_dump()["variants"][0]["type"] == "llm"
+
+
+def test_untyped_judge_defaults_to_llm_type():
+    spec = ExperimentSpec.model_validate(spec_dict(judge={"model": "j", "mode": "rubric"}))
+    assert spec.judge.type == "llm"
+    assert spec.model_dump()["judge"]["type"] == "llm"
+
+
+def test_type_default_injection_does_not_mutate_input():
+    # The before-validator that injects type: "llm" must copy, never mutate:
+    # tests (and callers) reuse spec dicts across validations.
+    data = spec_dict(judge={"model": "j", "mode": "rubric"})
+    ExperimentSpec.model_validate(data)
+    assert "type" not in data["variants"][0]
+    assert "type" not in data["judge"]
+    spec = ExperimentSpec.model_validate(data)
+    assert spec.variants[0].type == "llm"
+    assert spec.judge.type == "llm"
+
+
+def test_unknown_variant_type_rejected():
+    data = spec_dict()
+    data["variants"][0]["type"] = "carrier-pigeon"
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+def test_command_variant_validates_with_defaults():
+    spec = ExperimentSpec.model_validate(command_spec_dict())
+    assert spec.variants[0].type == "command"
+    assert spec.variants[0].command[0] == "python3"
+    assert spec.variants[0].timeout_s == 60.0
+
+
+def test_command_variant_requires_nonempty_argv():
+    data = command_spec_dict()
+    data["variants"][0]["command"] = []
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+@pytest.mark.parametrize("bad", [0, -1, float("inf"), float("nan")])
+def test_command_timeout_must_be_positive_and_finite(bad):
+    data = command_spec_dict()
+    data["variants"][0]["timeout_s"] = bad
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+def test_command_argv_rejects_lone_surrogate():
+    # Rendered argv enters cache keys via canonical_json, same as templates.
+    data = command_spec_dict()
+    data["variants"][0]["command"][1] = "bench\ud800.py"
+    with pytest.raises(ValidationError, match="lone surrogate"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_python_variant_accepts_import_path():
+    data = command_spec_dict()
+    data["variants"][0] = {"type": "python", "name": "fast", "callable": "examples.bench:run"}
+    spec = ExperimentSpec.model_validate(data)
+    assert spec.variants[0].type == "python"
+    assert spec.variants[0].callable == "examples.bench:run"
+
+
+@pytest.mark.parametrize("bad", ["no_colon", ":fn", "mod:", "mod:fn:extra", "mod path:fn"])
+def test_python_variant_rejects_malformed_import_path(bad):
+    data = command_spec_dict()
+    data["variants"][0] = {"type": "python", "name": "fast", "callable": bad}
+    with pytest.raises(ValidationError, match="callable"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_parse_float_judge_dumps_rubric_mode_without_model():
+    # stats.py reads spec_json["judge"]["mode"]; per-sample scalar scores are
+    # rubric-shaped. judge_audit additionally needs "model", which parse_float
+    # deliberately lacks — audit-judge on such a run errors cleanly.
+    spec = ExperimentSpec.model_validate(command_spec_dict())
+    assert spec.judge.type == "parse_float"
+    assert spec.judge.mode == "rubric"
+    dumped = spec.model_dump()["judge"]
+    assert dumped["mode"] == "rubric"
+    assert "model" not in dumped
+
+
+def test_parse_float_judge_rejects_llm_judge_fields():
+    data = command_spec_dict(judge={"type": "parse_float", "model": "m"})
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+def test_parse_float_judge_allows_more_than_two_variants():
+    data = command_spec_dict()
+    data["variants"].append({"type": "command", "name": "third", "command": ["x", "{seed}"]})
+    assert len(ExperimentSpec.model_validate(data).variants) == 3
+
+
+def test_sampling_optional_for_non_llm_specs():
+    spec = ExperimentSpec.model_validate(command_spec_dict())  # no sampling block at all
+    assert spec.sampling.model is None
+    assert spec.sampling.seed == 0
+    seeded = command_spec_dict(sampling={"seed": 7})
+    assert ExperimentSpec.model_validate(seeded).sampling.seed == 7
+
+
+def test_llm_variant_requires_sampling_model():
+    data = spec_dict(sampling={})
+    with pytest.raises(ValidationError, match=r"sampling\.model"):
+        ExperimentSpec.model_validate(data)
+    missing = spec_dict()
+    del missing["sampling"]
+    with pytest.raises(ValidationError, match=r"sampling\.model"):
+        ExperimentSpec.model_validate(missing)
+
+
+def test_mixed_llm_and_command_variants_allowed():
+    data = command_spec_dict(sampling={"model": "m"})
+    data["variants"][1] = {"name": "llm-arm", "user_template": "Do: {input}"}
+    spec = ExperimentSpec.model_validate(data)
+    assert [v.type for v in spec.variants] == ["command", "llm"]
+
+
+def test_command_argv_placeholders_validated_against_items(tmp_path):
+    data = command_spec_dict()
+    data["variants"][0]["command"] = ["python3", "bench.py", "--case", "{qestion}"]
+    spec = ExperimentSpec.model_validate(data)
+    with pytest.raises(ValueError, match="qestion"):
+        load_items(spec, tmp_path)
+
+
+def test_command_argv_seed_placeholder_is_always_available(tmp_path):
+    # command_spec_dict argv uses {seed}; items deliberately lack a seed field.
+    spec = ExperimentSpec.model_validate(command_spec_dict())
+    assert load_items(spec, tmp_path)
+
+
+def test_command_argv_id_placeholder_rejected(tmp_path):
+    data = command_spec_dict()
+    data["variants"][0]["command"] = ["python3", "bench.py", "--case", "{id}"]
+    spec = ExperimentSpec.model_validate(data)
+    with pytest.raises(ValueError, match="id"):
+        load_items(spec, tmp_path)
+
+
+def test_item_field_named_seed_reserved_for_command_variants(tmp_path):
+    data = command_spec_dict()
+    data["dataset"]["items"][0]["seed"] = 3
+    spec = ExperimentSpec.model_validate(data)
+    with pytest.raises(ValueError, match="reserved"):
+        load_items(spec, tmp_path)
+
+
+def test_item_field_named_seed_fine_without_command_variants(tmp_path):
+    data = spec_dict()
+    data["dataset"]["items"] = [
+        {"id": "q1", "input": "a", "seed": 1},
+        {"id": "q2", "input": "b", "seed": 2},
+    ]
+    assert load_items(ExperimentSpec.model_validate(data), tmp_path)
+
+
+def test_llm_judge_over_command_variants_validates(tmp_path):
+    # Cross-type composition: an LLM judge scoring subprocess outputs is legitimate.
+    data = command_spec_dict(judge={"model": "j", "mode": "pairwise"})
+    spec = ExperimentSpec.model_validate(data)
+    assert spec.judge.type == "llm"
+    assert load_items(spec, tmp_path)

@@ -1,0 +1,53 @@
+# Offline demo (M10): evaluate ANY stochastic system — here, two variants of a
+# seeded benchmark script — with Mimir's full statistics and NO API key:
+#
+#   uv run mimir run examples/subprocess.yaml --db bench.db
+#   uv run mimir analyze <run_id> --db bench.db
+#
+# How it works:
+# - Commands run with cwd = this file's directory, so noisy_bench.py is a
+#   relative path. Each argv element is rendered per item with {seed} and the
+#   item's fields; no shell is involved.
+# - `judge: {type: parse_float}` scores every sample by parsing the final
+#   stdout line as a float (rubric-shaped scores; keep them in [1, 10] so the
+#   HTML histogram axis fits).
+# - Outputs are content-addressed-cached exactly like LLM responses: re-running
+#   is instant, and raising n_samples executes only the new replicates. The
+#   cache CANNOT see edits to noisy_bench.py itself — after changing the
+#   script, add a version element to `command` or use a fresh --db.
+# - `limits` pace ALL condition types; the default 60 requests/minute would
+#   crawl through 120 local subprocess launches, so raise it for local work.
+name: noisy-bench
+description: two seeded stochastic estimators, scored from stdout (no LLM anywhere)
+
+variants:
+  - type: command
+    name: fast
+    command:
+      ["python3", "noisy_bench.py", "--algo", "fast",
+       "--seed", "{seed}", "--difficulty", "{difficulty}"]
+  - type: command
+    name: slow
+    command:
+      ["python3", "noisy_bench.py", "--algo", "slow",
+       "--seed", "{seed}", "--difficulty", "{difficulty}"]
+
+dataset:
+  items:
+    - {id: trivial, difficulty: "0.0"}
+    - {id: easy, difficulty: "0.5"}
+    - {id: medium, difficulty: "1.0"}
+    - {id: hard, difficulty: "1.5"}
+    - {id: brutal, difficulty: "2.0"}
+
+sampling:
+  seed: 7          # replicate i of every condition runs with seed 7+i (CRN)
+
+n_samples: 12
+
+judge:
+  type: parse_float
+
+limits:
+  concurrency: 8
+  requests_per_minute: 100000

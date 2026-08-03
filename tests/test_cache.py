@@ -13,7 +13,13 @@ import re
 
 import pytest
 
-from mimir.cache import build_payload, cache_key, canonical_json
+from mimir.cache import (
+    build_command_payload,
+    build_payload,
+    build_python_payload,
+    cache_key,
+    canonical_json,
+)
 
 
 def base_payload():
@@ -227,3 +233,123 @@ def test_unicode_payload_raw_utf8_and_golden_key():
     assert cache_key(build()) == cache_key(build())
     expected = "cbc9c58be3eac9bc46083cda70c0d65ec8e3b75ceb945b26c5f503f9d0180942"
     assert cache_key(build()) == expected
+
+
+# --- M10: command/python payload shapes (additive; the six-key LLM shape is LOCKED) ---
+
+
+def test_command_payload_shape_and_values():
+    # Exact key set doubles as the exclusion pin: timeout_s and base_dir are
+    # execution limits and must never enter the cache key (DESIGN \u00a73).
+    payload = build_command_payload(
+        argv=["python3", "bench.py", "--seed", "7"], seed=7, sample_index=0
+    )
+    assert set(payload) == {"type", "argv", "seed", "sample_index"}
+    assert payload["type"] == "command"
+    assert payload["argv"] == ["python3", "bench.py", "--seed", "7"]
+    assert payload["seed"] == 7
+    assert payload["sample_index"] == 0
+
+
+def test_python_payload_shape_and_values():
+    item = {"id": "q1", "input": "x"}
+    payload = build_python_payload(
+        callable_path="examples.bench:run", item=item, seed=3, sample_index=1
+    )
+    assert set(payload) == {"type", "callable", "item", "seed", "sample_index"}
+    assert payload["type"] == "python"
+    assert payload["callable"] == "examples.bench:run"
+    assert payload["item"] == item
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param({"argv": ["python3", "bench.py", "--seed", "8"]}, id="argv"),
+        pytest.param({"seed": 8}, id="seed"),
+        pytest.param({"sample_index": 1}, id="sample_index"),
+    ],
+)
+def test_command_payload_perturbation_changes_key(override):
+    kwargs = {"argv": ["python3", "bench.py", "--seed", "7"], "seed": 7, "sample_index": 0}
+    base = cache_key(build_command_payload(**kwargs))
+    kwargs.update(override)
+    assert cache_key(build_command_payload(**kwargs)) != base
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param({"callable_path": "examples.bench:walk"}, id="callable"),
+        pytest.param({"item": {"id": "q2"}}, id="item"),
+        pytest.param({"seed": 8}, id="seed"),
+        pytest.param({"sample_index": 1}, id="sample_index"),
+    ],
+)
+def test_python_payload_perturbation_changes_key(override):
+    kwargs = {"callable_path": "examples.bench:run", "item": {"id": "q1"}, "seed": 7}
+    base = cache_key(build_python_payload(sample_index=0, **kwargs))
+    kwargs.update(override)
+    sample_index = kwargs.pop("sample_index", 0)
+    assert cache_key(build_python_payload(sample_index=sample_index, **kwargs)) != base
+
+
+def test_new_payload_shapes_cannot_collide_with_the_llm_shape():
+    # The LOCKED six-key LLM payload has no "type" key; both new shapes carry one.
+    # canonical_json of different key sets can never be byte-equal, so no command
+    # or python payload can hash onto an existing LLM cache entry.
+    llm = base_payload()
+    assert "type" not in llm
+    command = build_command_payload(argv=["x"], seed=0, sample_index=0)
+    python = build_python_payload(callable_path="m:f", item={"id": "i"}, seed=0, sample_index=0)
+    assert command["type"] == "command"
+    assert python["type"] == "python"
+    assert cache_key(command) != cache_key(python)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seed", 7.0),
+        ("seed", True),
+        ("sample_index", 0.0),
+        ("sample_index", False),
+        ("argv", "not-a-list"),
+        ("argv", ["ok", 1]),
+    ],
+)
+def test_command_payload_rejects_wrongly_typed_fields(field, value):
+    kwargs = {"argv": ["python3"], "seed": 0, "sample_index": 0, field: value}
+    with pytest.raises(TypeError):
+        build_command_payload(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("seed", 7.0),
+        ("seed", True),
+        ("sample_index", 0.0),
+        ("callable_path", 3),
+        ("item", ["not", "a", "dict"]),
+    ],
+)
+def test_python_payload_rejects_wrongly_typed_fields(field, value):
+    kwargs = {"callable_path": "m:f", "item": {"id": "i"}, "seed": 0, "sample_index": 0}
+    kwargs[field] = value
+    with pytest.raises(TypeError):
+        build_python_payload(**kwargs)
+
+
+def test_command_payload_returns_fresh_structures():
+    argv = ["python3", "bench.py"]
+    payload = build_command_payload(argv=argv, seed=0, sample_index=0)
+    payload["argv"].append("--extra")
+    assert argv == ["python3", "bench.py"]
+
+
+def test_python_payload_copies_item():
+    item = {"id": "q1"}
+    payload = build_python_payload(callable_path="m:f", item=item, seed=0, sample_index=0)
+    payload["item"]["id"] = "changed"
+    assert item["id"] == "q1"

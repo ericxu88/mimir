@@ -62,3 +62,45 @@ def build_payload(
         "seed": _require_int("seed", seed),
         "sample_index": _require_int("sample_index", sample_index),
     }
+
+
+def build_command_payload(*, argv: list[str], seed: int, sample_index: int) -> dict[str, Any]:
+    """Payload for a command condition (M10, DESIGN §3): rendered argv + coordinates.
+
+    Additive shape — the six-key LLM payload above is LOCKED and unchanged. The
+    "type" key (absent from LLM payloads) makes cross-shape hash collisions
+    impossible. timeout_s and base_dir are execution limits, deliberately OUT of
+    the key, like `limits` for LLM calls; the program's own content is likewise
+    out (content-addressing covers the request, not the binary — bump a version
+    argv element after changing the program).
+    """
+    if not isinstance(argv, list) or not all(isinstance(element, str) for element in argv):
+        raise TypeError(f"argv must be a list of str, got {argv!r}")
+    return {
+        "type": "command",
+        "argv": list(argv),
+        "seed": _require_int("seed", seed),
+        "sample_index": _require_int("sample_index", sample_index),
+    }
+
+
+def build_python_payload(
+    *, callable_path: str, item: dict[str, Any], seed: int, sample_index: int
+) -> dict[str, Any]:
+    """Payload for a python-callable condition (M10, DESIGN §3).
+
+    The full item is in the key (the callable receives it verbatim, `id`
+    included). The function BODY is not — same staleness caveat as command
+    payloads.
+    """
+    if not isinstance(callable_path, str):
+        raise TypeError(f"callable_path must be a str, got {callable_path!r}")
+    if not isinstance(item, dict):
+        raise TypeError(f"item must be a dict, got {item!r}")
+    return {
+        "type": "python",
+        "callable": callable_path,
+        "item": dict(item),
+        "seed": _require_int("seed", seed),
+        "sample_index": _require_int("sample_index", sample_index),
+    }

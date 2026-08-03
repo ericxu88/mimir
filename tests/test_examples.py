@@ -55,3 +55,36 @@ def test_quickstart_analyze_exits_with_the_documented_error(tmp_path, capsys):
     header = (EXAMPLES / "quickstart.yaml").read_text(encoding="utf-8")
     assert "COLLECTS SAMPLES ONLY" in header
     assert "examples/judged.yaml" in header
+
+
+# --- M10: the subprocess example — full statistics, no API key ---------------------
+
+
+def test_subprocess_example_validates():
+    spec = load_spec(EXAMPLES / "subprocess.yaml")
+    items = load_items(spec, EXAMPLES)
+    assert len(items) == 5
+    assert all(variant.type == "command" for variant in spec.variants)
+    assert spec.judge.type == "parse_float"
+    assert spec.judge.mode == "rubric"
+
+
+def test_subprocess_example_runs_and_analyzes_keyless(tmp_path, monkeypatch, capsys):
+    # The repo's first fully-offline path to real statistical output: run and
+    # analyze with no ANTHROPIC_API_KEY, no --mock, no client at all.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db = tmp_path / "bench.db"
+    assert main(["run", str(EXAMPLES / "subprocess.yaml"), "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert " complete" in captured.out
+    assert "samples: 120 (0 errors)" in captured.out  # 2 variants x 5 items x 12
+    assert "judgments: 120 (0 errors)" in captured.out
+    assert captured.err == ""  # no mock notice, no warnings
+    run_id = captured.out.split()[1]
+
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "(rubric" in out
+    assert "fast" in out
+    assert "slow" in out
+    assert "95% CI" in out

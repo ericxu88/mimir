@@ -6,9 +6,10 @@ cache keys. The golden keys in tests/test_cache.py pin this indirectly.
 """
 
 import json
+import re
 import string
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -49,9 +50,20 @@ def _reject_lone_surrogates(value: str, what: str) -> str:
     return value
 
 
+# Placeholder available to command-variant argv templates beyond the item's own
+# fields; also RESERVED as a dataset field name when any command variant exists.
+_COMMAND_PLACEHOLDERS = frozenset({"seed"})
+
+# Import path for python variants: dotted module, colon, attribute.
+_IMPORT_PATH_RE = re.compile(r"^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*$")
+
+
 class Variant(BaseModel):
+    """An LLM prompt condition (M10: one of three condition types)."""
+
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["llm"] = "llm"
     name: str
     system: str = ""
     user_template: str
@@ -60,6 +72,47 @@ class Variant(BaseModel):
     @classmethod
     def _templates_utf8(cls, value: str, info) -> str:
         return _reject_lone_surrogates(value, f"variant {info.field_name}")
+
+
+class CommandVariant(BaseModel):
+    """A subprocess condition: argv-list template, no shell (M10).
+
+    Each element is str.format-rendered with the item's fields plus {seed};
+    rendered argv enters the cache key, so elements get the same UTF-8 guard
+    as prompt templates. `timeout_s` is an execution limit, deliberately OUT
+    of the cache key (DESIGN §3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["command"]
+    name: str
+    command: list[str] = Field(min_length=1)
+    timeout_s: float = Field(default=60.0, gt=0, allow_inf_nan=False)
+
+    @field_validator("command")
+    @classmethod
+    def _argv_utf8(cls, command: list[str]) -> list[str]:
+        for element in command:
+            _reject_lone_surrogates(element, "command argv element")
+        return command
+
+
+class PythonVariant(BaseModel):
+    """A python-callable condition referenced by import path (M10)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["python"]
+    name: str
+    callable: str
+
+    @field_validator("callable")
+    @classmethod
+    def _import_path_format(cls, value: str) -> str:
+        if not _IMPORT_PATH_RE.match(value):
+            raise ValueError(f'callable must look like "pkg.module:function", got {value!r}')
+        return value
 
 
 class Dataset(BaseModel):
@@ -100,7 +153,9 @@ class Dataset(BaseModel):
 class Sampling(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str
+    # None is valid only for specs with no llm variants (cross-field rule below);
+    # command/python conditions have no model, temperature, or token budget.
+    model: str | None = None
     temperature: float = Field(default=1.0, allow_inf_nan=False)
     max_tokens: int = Field(default=1024, ge=1)
     seed: int = 0
@@ -109,6 +164,7 @@ class Sampling(BaseModel):
 class Judge(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    type: Literal["llm"] = "llm"
     model: str
     mode: Literal["pairwise", "rubric"]
     temperature: float = Field(default=0.0, allow_inf_nan=False)
@@ -131,6 +187,28 @@ class Judge(BaseModel):
         return _DEFAULT_RUBRIC_TEMPLATE
 
 
+class ParseFloatScorerSpec(BaseModel):
+    """Score each sample by parsing a float from its output text (M10).
+
+    `mode` is the scoring SHAPE stats.py dispatches on: per-sample scalar scores
+    are rubric-shaped, so the dumped spec_json satisfies analyze_run unchanged.
+    Deliberately no `model` field — audit-judge on such a run raises its existing
+    "judge block is missing 'mode' or 'model'" ValueError, which is honest: there
+    is no LLM judge to audit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["parse_float"]
+    mode: Literal["rubric"] = "rubric"
+
+
+# Discriminated unions: `type` selects the member. Untyped dicts get type "llm"
+# injected by ExperimentSpec's before-validator so pre-M10 specs load unchanged.
+AnyVariant = Annotated[Variant | CommandVariant | PythonVariant, Field(discriminator="type")]
+AnyJudge = Annotated[Judge | ParseFloatScorerSpec, Field(discriminator="type")]
+
+
 class Limits(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -143,12 +221,37 @@ class ExperimentSpec(BaseModel):
 
     name: str
     description: str = ""
-    variants: list[Variant] = Field(min_length=1)
+    variants: list[AnyVariant] = Field(min_length=1)
     dataset: Dataset
-    sampling: Sampling
+    sampling: Sampling = Field(default_factory=Sampling)
     n_samples: int = Field(default=1, ge=1)
-    judge: Judge | None = None
+    judge: AnyJudge | None = None
     limits: Limits = Field(default_factory=Limits)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _default_types(cls, data: Any) -> Any:
+        # Discriminated unions need the tag present; pre-M10 specs have no `type`
+        # keys. Inject "llm" on COPIES only — callers reuse their spec dicts.
+        if not isinstance(data, dict):
+            return data
+        variants = data.get("variants")
+        judge = data.get("judge")
+        fix_variants = isinstance(variants, list) and any(
+            isinstance(v, dict) and "type" not in v for v in variants
+        )
+        fix_judge = isinstance(judge, dict) and "type" not in judge
+        if not (fix_variants or fix_judge):
+            return data
+        data = dict(data)
+        if fix_variants:
+            data["variants"] = [
+                {**v, "type": "llm"} if isinstance(v, dict) and "type" not in v else v
+                for v in variants
+            ]
+        if fix_judge:
+            data["judge"] = {**judge, "type": "llm"}
+        return data
 
     @model_validator(mode="after")
     def _validate_cross_field_rules(self) -> Self:
@@ -159,6 +262,8 @@ class ExperimentSpec(BaseModel):
             raise ValueError(
                 f"pairwise judging requires exactly 2 variants, got {len(self.variants)}"
             )
+        if self.sampling.model is None and any(v.type == "llm" for v in self.variants):
+            raise ValueError("sampling.model is required when any variant has type 'llm'")
         return self
 
 
@@ -186,17 +291,24 @@ def _validate_templates(spec: ExperimentSpec, items: list[dict[str, Any]]) -> No
     # KeyError at run time on the items that lack it.
     field_sets = [{k for k in item if k != "id"} for item in items]
     item_fields = set.intersection(*field_sets) if field_sets else set()
+    all_fields = set().union(*field_sets) if field_sets else set()
 
+    llm_judge = spec.judge if spec.judge is not None and spec.judge.type == "llm" else None
     judge_placeholders: frozenset[str] = frozenset()
-    if spec.judge is not None:
-        judge_placeholders = _JUDGE_PLACEHOLDERS_BY_MODE[spec.judge.mode]
-        all_fields = set().union(*field_sets) if field_sets else set()
+    if llm_judge is not None:
+        judge_placeholders = _JUDGE_PLACEHOLDERS_BY_MODE[llm_judge.mode]
         reserved = all_fields & judge_placeholders
         if reserved:
             raise ValueError(
                 f"dataset item fields {sorted(reserved)} are reserved for judge template"
-                f" placeholders in {spec.judge.mode} mode; rename these dataset fields"
+                f" placeholders in {llm_judge.mode} mode; rename these dataset fields"
             )
+
+    if any(v.type == "command" for v in spec.variants) and "seed" in all_fields:
+        raise ValueError(
+            "dataset item field 'seed' is reserved for the {seed} placeholder in"
+            " command variants; rename this dataset field"
+        )
 
     def check(template: str, context: str, extra_allowed: frozenset[str]) -> None:
         placeholders = _template_placeholders(template, context)
@@ -209,10 +321,16 @@ def _validate_templates(spec: ExperimentSpec, items: list[dict[str, Any]]) -> No
             )
 
     for variant in spec.variants:
-        check(variant.user_template, f"variant {variant.name!r} user_template", frozenset())
-    if spec.judge is not None:
+        if variant.type == "llm":
+            check(variant.user_template, f"variant {variant.name!r} user_template", frozenset())
+        elif variant.type == "command":
+            for position, element in enumerate(variant.command):
+                context = f"variant {variant.name!r} command[{position}]"
+                check(element, context, _COMMAND_PLACEHOLDERS)
+        # python variants render nothing: the callable receives (item, seed) directly.
+    if llm_judge is not None:
         check(
-            spec.judge.resolved_prompt_template(),
+            llm_judge.resolved_prompt_template(),
             "judge prompt_template",
             judge_placeholders,
         )

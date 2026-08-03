@@ -11,6 +11,7 @@ import asyncio
 import json
 import re
 import sqlite3
+import sys
 
 import pytest
 import yaml
@@ -480,3 +481,81 @@ def test_run_sqlite_error_exits_one(tmp_path, monkeypatch, capsys):
     spec_path.write_text(yaml.safe_dump(spec_dict()), encoding="utf-8")
     assert main(["run", str(spec_path), "--db", str(tmp_path / "r.db"), "--mock"]) == 1
     assert "database error:" in capsys.readouterr().err
+
+
+# --- M10: non-LLM specs run keyless, no client, no mock notice ---------------------
+
+
+def command_spec_yaml(tmp_path, *, judge=None):
+    code = "import sys; print(float(sys.argv[1]) + int(sys.argv[2]) / 10)"
+    spec = {
+        "name": "bench",
+        "variants": [
+            {
+                "type": "command",
+                "name": "fast",
+                "command": [sys.executable, "-c", code, "5.0", "{seed}"],
+            },
+            {
+                "type": "command",
+                "name": "slow",
+                "command": [sys.executable, "-c", code, "2.0", "{seed}"],
+            },
+        ],
+        "dataset": {"items": [{"id": "q1", "input": "a"}, {"id": "q2", "input": "b"}]},
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    if judge is not None:
+        spec["judge"] = judge
+    path = tmp_path / "bench.yaml"
+    path.write_text(yaml.safe_dump(spec), encoding="utf-8")
+    return path
+
+
+def test_run_command_spec_keyless_and_offline(tmp_path, monkeypatch, capsys):
+    # No llm parts -> no client is constructed at all; a missing key cannot matter.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = command_spec_yaml(tmp_path)
+    db = tmp_path / "results.db"
+    assert main(["run", str(spec_path), "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert " complete" in captured.out
+    assert "samples: 4 (0 errors)" in captured.out
+    assert captured.err == ""
+
+
+def test_run_command_spec_mock_flag_is_silent_noop(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = command_spec_yaml(tmp_path)
+    assert main(["run", str(spec_path), "--db", str(tmp_path / "r.db"), "--mock"]) == 0
+    assert "mock client" not in capsys.readouterr().err
+
+
+def test_analyze_parse_float_run_end_to_end(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = command_spec_yaml(tmp_path, judge={"type": "parse_float"})
+    db = tmp_path / "results.db"
+    assert main(["run", str(spec_path), "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    match = re.search(r"run (\S+) complete", out)
+    assert match is not None
+    assert "judgments: 4 (0 errors)" in out
+    assert main(["analyze", match.group(1), "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "(rubric" in captured.out
+    assert "fast" in captured.out
+    assert "slow" in captured.out
+    assert "-3.000" in captured.out  # slow (2.0) minus fast (5.0), seed 0 replicate 0
+    assert captured.err == ""
+
+
+def test_audit_judge_parse_float_run_errors_cleanly(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = command_spec_yaml(tmp_path, judge={"type": "parse_float"})
+    db = tmp_path / "results.db"
+    assert main(["run", str(spec_path), "--db", str(db)]) == 0
+    match = re.search(r"run (\S+) complete", capsys.readouterr().out)
+    assert main(["audit-judge", match.group(1), "--db", str(db)]) == 1
+    captured = capsys.readouterr()
+    assert "error:" in captured.err
+    assert re.search(r"mode|model", captured.err)

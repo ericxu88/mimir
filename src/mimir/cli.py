@@ -8,7 +8,9 @@ stdout stays parseable. Bare `mimir` prints the version and exits 0 (M0 contract
 `run` uses the real Anthropic client by default (its constructor reads
 ANTHROPIC_API_KEY; a missing key raises ValueError, caught by `_cmd_run`'s
 standard exit-1 path before the store is created). `--mock` swaps in the
-deterministic MockClient and never touches the environment.
+deterministic MockClient and never touches the environment. Specs with no llm
+parts (M10: command/python conditions, parse_float scorer) construct no client
+at all — they run keyless and offline, and `--mock` is a silent no-op.
 """
 
 import argparse
@@ -24,6 +26,7 @@ from mimir import __version__
 from mimir.clients.anthropic import AnthropicClient
 from mimir.clients.base import Client
 from mimir.clients.mock import MockClient
+from mimir.conditions import needs_client
 from mimir.judge_audit import audit_judge
 from mimir.report import render_analysis_text, render_audit_text, render_html
 from mimir.runner import run_experiment
@@ -78,7 +81,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     spec_path = Path(args.spec)
     try:
         spec = load_spec(spec_path)
-        client = _make_client(args)
+        client = _make_client(args) if needs_client(spec) else None
         store_cm = _new_store(args.db)
     except (ValueError, OSError, yaml.YAMLError) as exc:
         return _fail(str(exc))
