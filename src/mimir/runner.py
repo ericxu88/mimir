@@ -120,6 +120,7 @@ async def _call_with_retry(
     bucket: TokenBucket,
 ):
     for attempt in range(_MAX_ATTEMPTS):
+        retry_after = None
         async with semaphore:
             await bucket.acquire()
             try:
@@ -128,9 +129,15 @@ async def _call_with_retry(
                 retryable = exc.status_code == 429 or 500 <= exc.status_code < 600
                 if not retryable or attempt == _MAX_ATTEMPTS - 1:
                     raise
+                retry_after = exc.retry_after
         # Semaphore released during backoff so other units can proceed.
         delay = min(_MAX_DELAY_S, _BASE_DELAY_S * 2**attempt)
-        await _sleep(delay * random.uniform(0.5, 1.0))
+        wait = delay * random.uniform(0.5, 1.0)
+        if retry_after is not None:
+            # Provider backpressure floors the jittered backoff (M9); the cap keeps
+            # an absurd retry-after from parking a unit past _MAX_DELAY_S.
+            wait = max(wait, min(_MAX_DELAY_S, retry_after))
+        await _sleep(wait)
     raise AssertionError("unreachable")
 
 

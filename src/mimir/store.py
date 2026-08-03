@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS samples (
   error         TEXT,
   created_at    TEXT NOT NULL,
   UNIQUE (condition_id, item_id, sample_index),
+  UNIQUE (run_id, id),
   -- Composite FK: a sample's condition must belong to the sample's own run.
   FOREIGN KEY (run_id, condition_id) REFERENCES conditions (run_id, id)
 );
@@ -73,8 +74,8 @@ CREATE TABLE IF NOT EXISTS judgments (
   item_id        TEXT NOT NULL,
   judge_model    TEXT NOT NULL,
   mode           TEXT NOT NULL,
-  sample_a_id    INTEGER NOT NULL REFERENCES samples(id),
-  sample_b_id    INTEGER REFERENCES samples(id),
+  sample_a_id    INTEGER NOT NULL,
+  sample_b_id    INTEGER,
   position_order TEXT,
   cache_key      TEXT NOT NULL,
   raw_response   TEXT,
@@ -84,7 +85,13 @@ CREATE TABLE IF NOT EXISTS judgments (
   input_tokens   INTEGER,
   output_tokens  INTEGER,
   error          TEXT,
-  created_at     TEXT NOT NULL
+  created_at     TEXT NOT NULL,
+  -- Run-scoped FKs (M9): a judgment's samples must belong to the judgment's own
+  -- run (a NULL sample_b_id leaves that FK unenforced, as SQLite defines).
+  -- Pre-M9 databases keep the old DDL (CREATE IF NOT EXISTS never alters), so the
+  -- skip-and-count drifted-row guards in stats/judge_audit remain load-bearing.
+  FOREIGN KEY (run_id, sample_a_id) REFERENCES samples (run_id, id),
+  FOREIGN KEY (run_id, sample_b_id) REFERENCES samples (run_id, id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_judgments_run_id ON judgments(run_id);

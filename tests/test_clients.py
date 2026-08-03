@@ -84,3 +84,12 @@ def test_client_error_carries_status_code():
     error = ClientError(429)
     assert error.status_code == 429
     assert "429" in str(error)
+
+
+def test_client_error_carries_retry_after():
+    # Provider backpressure (M9): the adapter forwards the retry-after header so
+    # the runner can floor its backoff on it; absent by default.
+    assert ClientError(429).retry_after is None
+    error = ClientError(429, retry_after=30.0)
+    assert error.retry_after == 30.0
+    assert error.status_code == 429

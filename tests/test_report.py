@@ -561,3 +561,46 @@ def test_power_row_names_the_family_adjusted_alpha():
 
 def test_power_row_omits_the_alpha_note_for_a_lone_comparison():
     assert "planned at alpha" not in render_analysis_text(make_result())
+
+
+# --- M9: tiny-p display floor + judge-card label disambiguation -------------------
+
+
+def test_tiny_p_never_renders_as_zero():
+    # Sign-flip p is never 0 by construction (exhaustive floor 2/2^n, MC add-one
+    # smoothing), but .4f prints 2/2^16 as the lie "0.0000" - floor the display.
+    comparison = make_comparison(
+        p_value=2 / 2**16,
+        n_permutations=65536,
+        item_ids=tuple(f"q{i}" for i in range(16)),
+        n_items=16,
+    )
+    text = render_analysis_text(make_result(comparisons=[comparison]))
+    assert "p-value:          <0.0001 (exhaustive, 65536 permutations)" in text
+    assert "0.0000" not in text
+
+
+def test_tiny_corrected_p_never_renders_as_zero():
+    comparison = make_comparison(
+        p_value=1 / 10001,
+        p_value_corrected=3 / 100_000,
+        correction_method="holm",
+        n_comparisons=3,
+        p_method="monte_carlo",
+        n_permutations=10_000,
+    )
+    text = render_analysis_text(
+        make_result(comparisons=[comparison] * 3, correction_method="holm")
+    )
+    assert "<0.0001 (holm-corrected, monte_carlo, 10000 permutations)" in text
+    assert "0.0000" not in text
+
+
+def test_html_judge_card_labels_disambiguated_from_summary():
+    # "judgments used" means scoring-usable rows in the stats summary and
+    # audit-usable rows on the judge card - same words, different numbers, one
+    # document. The card labels itself.
+    out = render_html(make_result(), make_card(), status="complete")
+    assert "<th>judgments used (audit)</th>" in out
+    assert "<th>judgments errored (audit)</th>" in out
+    assert out.count("<th>judgments used</th>") == 1  # the stats summary header only

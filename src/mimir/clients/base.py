@@ -11,10 +11,17 @@ from pydantic import BaseModel, ConfigDict
 
 
 class ClientError(Exception):
-    """A provider-level failure. 429 and 5xx are retryable; everything else is not."""
+    """A provider-level failure. 429 and 5xx are retryable; everything else is not.
 
-    def __init__(self, status_code: int, message: str = "") -> None:
+    `retry_after` (seconds, M9) carries the provider's retry-after header when one
+    was sent; the runner uses it as a floor under its exponential backoff.
+    """
+
+    def __init__(
+        self, status_code: int, message: str = "", *, retry_after: float | None = None
+    ) -> None:
         self.status_code = status_code
+        self.retry_after = retry_after
         super().__init__(message or f"client error: status {status_code}")
 
 

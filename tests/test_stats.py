@@ -8,6 +8,7 @@ wide margin. Never change a seed to make a test pass — that inverts the oracle
 """
 
 import re
+import sqlite3
 import zlib
 
 import numpy as np
@@ -113,6 +114,49 @@ def add_rubric_judgment(store, run_id, item_id, *, sample_id, score, error=None)
 
 def tables(store, run_id):
     return store.get_judgments(run_id), store.get_samples(run_id), store.get_conditions(run_id)
+
+
+def insert_legacy_judgment(
+    db_path,
+    run_id,
+    item_id,
+    *,
+    mode,
+    sample_a_id,
+    sample_b_id=None,
+    position_order=None,
+    verdict=None,
+    score=None,
+):
+    """Simulate legacy/drifted data: a judgment referencing another run's sample.
+
+    New databases enforce the run-scoped judgment FK (M9), so the row goes in
+    through a separate raw connection (sqlite3 foreign_keys defaults OFF per
+    connection) — exactly how such rows exist in the wild: written under the
+    pre-M9 schema. The skip-and-count guards under test exist for those files.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO judgments (run_id, item_id, judge_model, mode, sample_a_id,"
+            " sample_b_id, position_order, cache_key, verdict, score, created_at)"
+            " VALUES (?, ?, 'judge-model', ?, ?, ?, ?, ?, ?, ?,"
+            " '2026-01-01T00:00:00+00:00')",
+            (
+                run_id,
+                item_id,
+                mode,
+                sample_a_id,
+                sample_b_id,
+                position_order,
+                "j" * 64,
+                verdict,
+                score,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # --- pure math: bootstrap CI ------------------------------------------------------
@@ -866,9 +910,9 @@ def test_resampling_counts_must_be_positive(call):
 # --- review-driven hardening (M5): foreign-sample drifted rows --------------------
 
 
-def test_pairwise_foreign_sample_judgment_counted_errored(store):
-    # judgments.sample_a_id is FK-valid against ANY run's samples; a row referencing
-    # another run's sample is drifted data and must skip-and-count, never KeyError
+def test_pairwise_foreign_sample_judgment_counted_errored(store, tmp_path):
+    # A judgment referencing another run's sample is drifted data (pre-M9 files
+    # lack the run-scoped FK) and must skip-and-count, never KeyError
     # (found by the M5 review: analyze crashed where audit-judge handled it).
     run_id, cond = make_run(store)
     control_sid = add_ok_sample(store, run_id, cond["control"], "q1")
@@ -884,15 +928,14 @@ def test_pairwise_foreign_sample_judgment_counted_errored(store):
     )
     other_run, other_cond = make_run(store)
     foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
-    store.add_judgment(
-        run_id=run_id,
-        item_id="q1",
-        judge_model="judge-model",
+    insert_legacy_judgment(
+        tmp_path / "mimir.db",
+        run_id,
+        "q1",
         mode="pairwise",
         sample_a_id=foreign_sid,
         sample_b_id=treatment_sid,
         position_order="ab",
-        cache_key="j" * 64,
         verdict="A",
     )
     table = pairwise_item_scores(*tables(store, run_id))
@@ -901,13 +944,15 @@ def test_pairwise_foreign_sample_judgment_counted_errored(store):
     assert table.scores["control"] == {"q1": 1.0}
 
 
-def test_rubric_foreign_sample_judgment_counted_errored(store):
+def test_rubric_foreign_sample_judgment_counted_errored(store, tmp_path):
     run_id, cond = make_run(store, mode="rubric")
     sid = add_ok_sample(store, run_id, cond["control"], "q1")
     add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=7)
     other_run, other_cond = make_run(store, mode="rubric")
     foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
-    add_rubric_judgment(store, run_id, "q2", sample_id=foreign_sid, score=3)
+    insert_legacy_judgment(
+        tmp_path / "mimir.db", run_id, "q2", mode="rubric", sample_a_id=foreign_sid, score=3.0
+    )
     table = rubric_item_scores(*tables(store, run_id))
     assert table.n_judgments_used == 1
     assert table.n_judgments_errored == 1
@@ -1211,7 +1256,7 @@ def test_pairwise_replicate_scores_requires_two_conditions(store):
         pairwise_replicate_scores(*tables(store, run_id))
 
 
-def test_pairwise_replicate_scores_skip_and_count_drifted_rows(store):
+def test_pairwise_replicate_scores_skip_and_count_drifted_rows(store, tmp_path):
     run_id, cond = make_run(store)
     c_sid = add_ok_sample(store, run_id, cond["control"], "q1")
     t_sid = add_ok_sample(store, run_id, cond["treatment"], "q1")
@@ -1230,15 +1275,14 @@ def test_pairwise_replicate_scores_skip_and_count_drifted_rows(store):
     )
     other_run, other_cond = make_run(store)
     foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
-    store.add_judgment(
-        run_id=run_id,
-        item_id="q1",
-        judge_model="judge-model",
+    insert_legacy_judgment(
+        tmp_path / "mimir.db",
+        run_id,
+        "q1",
         mode="pairwise",
         sample_a_id=foreign_sid,
         sample_b_id=t_sid,
         position_order="ab",
-        cache_key="j" * 64,
         verdict="A",
     )
     table = pairwise_replicate_scores(*tables(store, run_id))
@@ -1247,14 +1291,16 @@ def test_pairwise_replicate_scores_skip_and_count_drifted_rows(store):
     assert table.scores["control"] == {"q1": {0: 1.0}}
 
 
-def test_rubric_replicate_scores_skip_and_count_drifted_rows(store):
+def test_rubric_replicate_scores_skip_and_count_drifted_rows(store, tmp_path):
     run_id, cond = make_run(store, mode="rubric")
     sid = add_ok_sample(store, run_id, cond["control"], "q1")
     add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=7)
     add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=3, error="boom")
     other_run, other_cond = make_run(store, mode="rubric")
     foreign_sid = add_ok_sample(store, other_run, other_cond["control"], "q1")
-    add_rubric_judgment(store, run_id, "q2", sample_id=foreign_sid, score=5)
+    insert_legacy_judgment(
+        tmp_path / "mimir.db", run_id, "q2", mode="rubric", sample_a_id=foreign_sid, score=5.0
+    )
     table = rubric_replicate_scores(*tables(store, run_id))
     assert table.n_judgments_used == 1
     assert table.n_judgments_errored == 2
@@ -1794,3 +1840,34 @@ def test_allocation_ladder_is_monotone_and_matches_the_headline_power_row():
     assert decomposition.n_required_items_current == required_items_for_power(means) == 3
     assert decomposition.n_required_items_double <= decomposition.n_required_items_current
     assert decomposition.n_required_items_limit <= decomposition.n_required_items_double
+
+
+# --- M9: audit-minor remediations -------------------------------------------------
+
+
+def test_analyze_run_judge_block_missing_mode_raises_value_error(store):
+    # Reachable only via hand-edited spec_json (the pydantic spec requires mode);
+    # analyze_run must fail like audit_judge does, never with a bare KeyError.
+    run_id = store.create_run("greeting-tone", {"judge": {"model": "judge-model"}})
+    cid = store.add_condition(
+        run_id,
+        variant_name="control",
+        system_prompt="",
+        user_template="A: {input}",
+        sampling={"model": "m"},
+    )
+    sid = add_ok_sample(store, run_id, cid, "q1")
+    add_rubric_judgment(store, run_id, "q1", sample_id=sid, score=5)
+    with pytest.raises(ValueError, match="missing 'mode'"):
+        analyze_run(store, run_id)
+
+
+def test_decompose_share_between_none_when_no_variance():
+    # A perfect CRN null: every replicate diff identical, no variance anywhere.
+    # A share of 1.0 here would claim item dominance over zero variance; None is
+    # the honest answer (share_between is never rendered - programmatic API only).
+    v = decompose_variance({"q1": [0.0, 0.0], "q2": [0.0, 0.0]}, mean_diff=0.0)
+    assert v is not None
+    assert v.share_between is None
+    assert v.n_required_items_current is None
+    assert v.recommendation == "more_items"

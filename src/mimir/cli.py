@@ -85,13 +85,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     with store_cm as store:
         try:
             run_id = asyncio.run(run_experiment(spec, store, client, base_dir=spec_path.parent))
+            status = store.get_run(run_id)["status"]
+            samples = store.get_samples(run_id)
+            judgments = store.get_judgments(run_id)
         except (ValueError, OSError) as exc:
             # OSError: a missing/unreadable dataset file raises inside
             # run_experiment (load_items), before any run row exists.
             return _fail(str(exc))
-        status = store.get_run(run_id)["status"]
-        samples = store.get_samples(run_id)
-        judgments = store.get_judgments(run_id)
+        except sqlite3.Error as exc:
+            # Mid-command database failures (corruption, disk) exit 1, never
+            # traceback (M9); open-time failures are wrapped by _new_store.
+            return _fail(f"database error: {exc}")
     sample_errors = sum(1 for row in samples if row["error"] is not None)
     judgment_errors = sum(1 for row in judgments if row["error"] is not None)
     print(f"run {run_id} {status}")
@@ -126,6 +130,8 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
                     card = None
     except ValueError as exc:
         return _fail(str(exc))
+    except sqlite3.Error as exc:
+        return _fail(f"database error: {exc}")
     _warn_on_status(status, args.run_id)
     print(render_analysis_text(result, status=status))
     if args.html is not None:
@@ -145,6 +151,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             status = store.get_run(args.run_id)["status"]
     except ValueError as exc:
         return _fail(str(exc))
+    except sqlite3.Error as exc:
+        return _fail(f"database error: {exc}")
     _warn_on_status(status, args.run_id)
     print(render_audit_text(card))
     return 0

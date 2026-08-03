@@ -7,6 +7,8 @@ these constructions. A failed oracle means fix the construction or the implement
 never loosen the assertion.
 """
 
+import sqlite3
+
 import pytest
 
 from mimir.clients.mock import MockClient
@@ -100,6 +102,49 @@ def add_rubric_judgment(store, run_id, item_id, *, sample_id, score, error=None)
 
 def tables(store, run_id):
     return store.get_judgments(run_id), store.get_samples(run_id), store.get_conditions(run_id)
+
+
+def insert_legacy_judgment(
+    db_path,
+    run_id,
+    item_id,
+    *,
+    mode,
+    sample_a_id,
+    sample_b_id=None,
+    position_order=None,
+    verdict=None,
+    score=None,
+):
+    """Simulate legacy/drifted data: a judgment referencing another run's sample.
+
+    New databases enforce the run-scoped judgment FK (M9), so the row goes in
+    through a separate raw connection (sqlite3 foreign_keys defaults OFF per
+    connection) — exactly how such rows exist in the wild: written under the
+    pre-M9 schema. The skip-and-count guards under test exist for those files.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO judgments (run_id, item_id, judge_model, mode, sample_a_id,"
+            " sample_b_id, position_order, cache_key, verdict, score, created_at)"
+            " VALUES (?, ?, 'judge-model', ?, ?, ?, ?, ?, ?, ?,"
+            " '2026-01-01T00:00:00+00:00')",
+            (
+                run_id,
+                item_id,
+                mode,
+                sample_a_id,
+                sample_b_id,
+                position_order,
+                "j" * 64,
+                verdict,
+                score,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_pair(store, run_id, cond, item_id, *, sample_index=0, texts=(None, None)):
@@ -418,11 +463,12 @@ def test_position_bias_no_swapped_pairs_flip_rate_none(store):
     assert result.position_a_win_rate == 1.0
 
 
-def test_position_bias_drifted_rows_counted_errored_no_crash(store):
+def test_position_bias_drifted_rows_counted_errored_no_crash(store, tmp_path):
     # Rows the runner never writes must count as errored, not crash (M3 precedent):
     # unknown verdict, NULL verdict, NULL sample_b_id, foreign samples in either
     # position (verdict chosen so the outcome would dereference the foreign side),
-    # and a self-pair (sample_a_id == sample_b_id).
+    # and a self-pair (sample_a_id == sample_b_id). The foreign-sample rows go in
+    # via the raw legacy path — new databases reject them at the FK (M9).
     run_id, cond = make_run(store)
     first, second = add_pair(store, run_id, cond, "q1")
     add_pair_judgment(
@@ -437,8 +483,6 @@ def test_position_bias_drifted_rows_counted_errored_no_crash(store):
         {"sample_a_id": first, "sample_b_id": second, "verdict": "C"},
         {"sample_a_id": first, "sample_b_id": second, "verdict": None},
         {"sample_a_id": first, "sample_b_id": None, "verdict": "B"},
-        {"sample_a_id": foreign_sid, "sample_b_id": second, "verdict": "A"},
-        {"sample_a_id": first, "sample_b_id": foreign_sid, "verdict": "B"},
         {"sample_a_id": first, "sample_b_id": first, "verdict": "A"},
     ):
         store.add_judgment(
@@ -449,6 +493,13 @@ def test_position_bias_drifted_rows_counted_errored_no_crash(store):
             position_order="ab",
             cache_key="j" * 64,
             **drifted,
+        )
+    for drifted in (
+        {"sample_a_id": foreign_sid, "sample_b_id": second, "verdict": "A"},
+        {"sample_a_id": first, "sample_b_id": foreign_sid, "verdict": "B"},
+    ):
+        insert_legacy_judgment(
+            tmp_path / "mimir.db", run_id, "q1", mode="pairwise", position_order="ab", **drifted
         )
     result = position_bias(*tables(store, run_id))
     assert result.n_rows_used == 2
@@ -629,7 +680,7 @@ def test_length_bias_rubric_constant_scores_slope_zero_r_none(store):
     assert result.correlation is None
 
 
-def test_length_bias_rubric_errored_and_drifted_rows_skipped(store):
+def test_length_bias_rubric_errored_and_drifted_rows_skipped(store, tmp_path):
     run_id, cond = make_run(store, mode="rubric", variants=("solo",))
     for item, length, score in (("q1", 8, 1), ("q2", 16, 2)):
         sid = add_ok_sample(store, run_id, cond["solo"], item, response_text="x" * length)
@@ -646,10 +697,13 @@ def test_length_bias_rubric_errored_and_drifted_rows_skipped(store):
         sample_a_id=sid,
         cache_key="j" * 64,
     )
-    # Drifted: a judgment referencing another run's sample.
+    # Drifted: a judgment referencing another run's sample (raw legacy path — new
+    # databases reject this at the run-scoped FK, M9).
     other_run, other_cond = make_run(store, mode="rubric", variants=("solo",))
     foreign_sid = add_ok_sample(store, other_run, other_cond["solo"], "q1")
-    add_rubric_judgment(store, run_id, "q5", sample_id=foreign_sid, score=5)
+    insert_legacy_judgment(
+        tmp_path / "mimir.db", run_id, "q5", mode="rubric", sample_a_id=foreign_sid, score=5.0
+    )
     # Drifted: usable score on a sample with NULL response_text (used, not a point).
     null_sid = store.add_sample(
         run_id=run_id,

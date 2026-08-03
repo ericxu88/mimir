@@ -52,7 +52,11 @@ class AnthropicClient:
         latency_ms = (time.monotonic() - start) * 1000.0
 
         if not (200 <= response.status_code < 300):
-            raise ClientError(response.status_code, _error_message(response))
+            raise ClientError(
+                response.status_code,
+                _error_message(response),
+                retry_after=_retry_after_seconds(response),
+            )
 
         data = response.json()
         text = "".join(block["text"] for block in data["content"] if block.get("type") == "text")
@@ -85,3 +89,16 @@ def _error_message(response: httpx.Response) -> str:
         return response.json()["error"]["message"]
     except (ValueError, KeyError, TypeError):
         return ""
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    # Seconds form only; the HTTP-date form is deliberately ignored (the runner's
+    # exponential backoff already covers it, and date parsing needs a clock).
+    raw = response.headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None

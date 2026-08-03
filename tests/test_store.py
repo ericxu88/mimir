@@ -518,3 +518,57 @@ def test_condition_with_bogus_run_id_rejected(store):
             user_template="t",
             sampling={},
         )
+
+
+def test_new_databases_reject_cross_run_judgments(store):
+    # Run-scoped judgment FKs (M9): on databases created from this schema, a
+    # judgment's samples must belong to the judgment's own run. Pre-M9 files keep
+    # the old DDL (CREATE IF NOT EXISTS never alters), which is why the
+    # skip-and-count drifted-row guards in stats/judge_audit stay load-bearing.
+    run_a, cond_a = make_run_with_condition(store)
+    run_b, cond_b = make_run_with_condition(store)
+    sid_b = store.add_sample(
+        run_id=run_b,
+        condition_id=cond_b,
+        item_id="q1",
+        sample_index=0,
+        cache_key="k" * 64,
+        request_json="{}",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        store.add_judgment(
+            run_id=run_a,
+            item_id="q1",
+            judge_model="judge-model",
+            mode="rubric",
+            sample_a_id=sid_b,
+            cache_key="j" * 64,
+        )
+    sid_a = store.add_sample(
+        run_id=run_a,
+        condition_id=cond_a,
+        item_id="q1",
+        sample_index=0,
+        cache_key="k" * 64,
+        request_json="{}",
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        store.add_judgment(
+            run_id=run_a,
+            item_id="q1",
+            judge_model="judge-model",
+            mode="pairwise",
+            sample_a_id=sid_a,
+            sample_b_id=sid_b,
+            position_order="ab",
+            cache_key="j" * 64,
+        )
+    # Same-run judgments (and NULL sample_b_id) still insert.
+    assert store.add_judgment(
+        run_id=run_a,
+        item_id="q1",
+        judge_model="judge-model",
+        mode="rubric",
+        sample_a_id=sid_a,
+        cache_key="j" * 64,
+    )

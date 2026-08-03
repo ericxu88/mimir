@@ -26,9 +26,13 @@ class MockClient:
         """First matching rule supplies the response text; otherwise it is derived."""
         self._rules.append((predicate, text))
 
-    def queue_error(self, status_code: int, times: int = 1) -> None:
+    def queue_error(
+        self, status_code: int, times: int = 1, *, retry_after: float | None = None
+    ) -> None:
         """The next `times` calls raise ClientError(status_code), FIFO."""
-        self._errors.extend(ClientError(status_code) for _ in range(times))
+        self._errors.extend(
+            ClientError(status_code, retry_after=retry_after) for _ in range(times)
+        )
 
     async def complete(self, request: CompletionRequest) -> CompletionResponse:
         self.calls.append(request)

@@ -35,12 +35,31 @@ _JUDGE_PLACEHOLDERS_BY_MODE = {
 }
 
 
+def _reject_lone_surrogates(value: str, what: str) -> str:
+    # json.loads (and YAML) accept lone-surrogate escapes that canonical_json's
+    # utf-8 encode rejects; caught at spec load they are one clear error instead of
+    # an error row per unit (M9).
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(
+            f"{what} contains a lone surrogate (not valid UTF-8; it would poison"
+            " cache keys and stored spec JSON)"
+        ) from None
+    return value
+
+
 class Variant(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
     system: str = ""
     user_template: str
+
+    @field_validator("system", "user_template")
+    @classmethod
+    def _templates_utf8(cls, value: str, info) -> str:
+        return _reject_lone_surrogates(value, f"variant {info.field_name}")
 
 
 class Dataset(BaseModel):
@@ -96,6 +115,13 @@ class Judge(BaseModel):
     max_tokens: int = Field(default=512, ge=1)
     prompt_template: str | None = None
     position_swap: bool = True
+
+    @field_validator("prompt_template")
+    @classmethod
+    def _template_utf8(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _reject_lone_surrogates(value, "judge prompt_template")
 
     def resolved_prompt_template(self) -> str:
         if self.prompt_template is not None:

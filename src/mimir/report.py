@@ -108,15 +108,21 @@ def _fmt(value: float | None, spec: str = ".3f") -> str:
 _CORRECTION_LABELS = {"bh": "Benjamini-Hochberg FDR", "holm": "Holm-Bonferroni"}
 
 
+def _fmt_p(p: float) -> str:
+    # Sign-flip p is never 0 by construction (exhaustive floor 2/2^n, MC add-one
+    # smoothing), but .4f would render anything below 5e-5 as the lie "0.0000" (M9).
+    return f"{p:.4f}" if p >= 0.00005 else "<0.0001"
+
+
 def _p_value_text(c: Comparison, *, html: bool = False) -> str:
     # M7 mandate: a multi-arm family NEVER renders the raw p — corrected only.
     if c.n_comparisons > 1 and c.p_value_corrected is not None:
         family = f", {c.n_comparisons} comparisons" if html else ""
         return (
-            f"{c.p_value_corrected:.4f} ({c.correction_method}-corrected{family},"
+            f"{_fmt_p(c.p_value_corrected)} ({c.correction_method}-corrected{family},"
             f" {c.p_method}, {c.n_permutations} permutations)"
         )
-    return f"{c.p_value:.4f} ({c.p_method}, {c.n_permutations} permutations)"
+    return f"{_fmt_p(c.p_value)} ({c.p_method}, {c.n_permutations} permutations)"
 
 
 def _ci_text(c: Comparison) -> str:
@@ -425,8 +431,10 @@ def _judge_html(card: JudgeReportCard) -> str:
     rows = [
         ("judge model", _esc(card.judge_model)),
         ("mode", _esc(card.mode)),
-        ("judgments used", str(card.n_judgments_used)),
-        ("judgments errored", str(card.n_judgments_errored)),
+        # "(audit)" disambiguates from the stats summary in the same document (M9):
+        # audit-usable rows are counted differently from scoring-usable rows.
+        ("judgments used (audit)", str(card.n_judgments_used)),
+        ("judgments errored (audit)", str(card.n_judgments_errored)),
         ("flip rate", flip),
         ("position-A win rate", _fmt(card.position_a_win_rate)),
         ("length slope", _fmt(card.length_slope, ".4g")),

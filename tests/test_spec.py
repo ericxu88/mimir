@@ -394,3 +394,32 @@ def test_empty_dataset_rejected(tmp_path):
     from_file["dataset"] = {"path": "data.jsonl"}
     with pytest.raises(ValueError, match="empty"):
         load_items(ExperimentSpec.model_validate(from_file), tmp_path)
+
+
+# --- M9: templates must be UTF-8 (lone surrogates poison cache keys) ---------------
+
+
+def test_variant_system_rejects_lone_surrogate():
+    data = spec_dict()
+    data["variants"][0]["system"] = "You are helpful.\ud800"
+    with pytest.raises(ValidationError, match="lone surrogate"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_variant_user_template_rejects_lone_surrogate():
+    data = spec_dict()
+    data["variants"][1]["user_template"] = "Answer the question: {input}\udfff"
+    with pytest.raises(ValidationError, match="lone surrogate"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_judge_prompt_template_rejects_lone_surrogate():
+    data = spec_dict(
+        judge={
+            "model": "judge-model",
+            "mode": "rubric",
+            "prompt_template": "Q: {input}\nA: {response}\nRate 1-10.\ud800",
+        }
+    )
+    with pytest.raises(ValidationError, match="lone surrogate"):
+        ExperimentSpec.model_validate(data)

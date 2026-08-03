@@ -10,6 +10,7 @@ numbers) and the seeding Store is always closed before main() runs.
 import asyncio
 import json
 import re
+import sqlite3
 
 import pytest
 import yaml
@@ -442,3 +443,40 @@ def test_analyze_correction_flag_on_two_variant_run(tmp_path, capsys):
     run_id = seed_judged_run(db)
     assert main(["analyze", run_id, "--db", str(db), "--correction", "holm"]) == 0
     assert capsys.readouterr().err == ""
+
+
+# --- M9: sqlite3.Error surfaces as exit 1, never a traceback ----------------------
+
+
+def test_analyze_sqlite_error_exits_one(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "results.db"
+    Store(db).close()  # analyze refuses a missing db before touching analyze_run
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database disk image is malformed")
+
+    monkeypatch.setattr("mimir.cli.analyze_run", boom)
+    assert main(["analyze", "some-run", "--db", str(db)]) == 1
+    assert "database error:" in capsys.readouterr().err
+
+
+def test_audit_sqlite_error_exits_one(tmp_path, monkeypatch, capsys):
+    db = tmp_path / "results.db"
+    Store(db).close()
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database disk image is malformed")
+
+    monkeypatch.setattr("mimir.cli.audit_judge", boom)
+    assert main(["audit-judge", "some-run", "--db", str(db)]) == 1
+    assert "database error:" in capsys.readouterr().err
+
+
+def test_run_sqlite_error_exits_one(tmp_path, monkeypatch, capsys):
+    async def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("database disk image is malformed")
+
+    monkeypatch.setattr("mimir.cli.run_experiment", boom)
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(yaml.safe_dump(spec_dict()), encoding="utf-8")
+    assert main(["run", str(spec_path), "--db", str(tmp_path / "r.db"), "--mock"]) == 1
+    assert "database error:" in capsys.readouterr().err

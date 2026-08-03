@@ -44,7 +44,7 @@ results append to `mimir.db` in the current directory (override with `--db`). re
 | command | what it does |
 | --- | --- |
 | `mimir run SPEC [--db PATH] [--mock]` | run the experiment (and its judge, if configured) |
-| `mimir analyze RUN_ID [--db PATH] [--html [PATH]]` | paired-bootstrap stats report, optionally as HTML |
+| `mimir analyze RUN_ID [--db PATH] [--html [PATH]] [--correction {bh,holm}]` | paired-bootstrap stats report, optionally as HTML; `--correction` picks the multi-arm p-value correction (default holm) |
 | `mimir audit-judge RUN_ID [--compare RUN_ID] [--db PATH]` | judge reliability report card |
 
 exit codes: `0` success, `1` domain errors (bad spec, missing files, missing API key, a run ending `failed`), `2` usage errors. reports go to stdout; warnings and notices go to stderr.

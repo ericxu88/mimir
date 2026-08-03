@@ -310,3 +310,28 @@ async def test_run_experiment_retries_through_adapter(store, monkeypatch):
     assert row["response_text"] == "hi"
     assert row["input_tokens"] == 10
     assert all("seed" not in body for body in requests)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("headers", "expected"),
+    [
+        pytest.param({"retry-after": "30"}, 30.0, id="integer-seconds"),
+        pytest.param({"retry-after": "1.5"}, 1.5, id="fractional-seconds"),
+        pytest.param({"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}, None, id="http-date"),
+        pytest.param({}, None, id="absent"),
+        pytest.param({"retry-after": "-5"}, None, id="negative"),
+    ],
+)
+async def test_retry_after_header_parsed_onto_client_error(monkeypatch, headers, expected):
+    # Seconds form only; the HTTP-date form is deliberately ignored (None) - the
+    # runner's exponential backoff already covers it.
+    error_body = {"type": "error", "error": {"type": "rate_limit_error", "message": "slow"}}
+
+    def handler(request):
+        return httpx.Response(429, json=error_body, headers=headers)
+
+    client = make_client(monkeypatch, httpx.MockTransport(handler))
+    with pytest.raises(ClientError) as excinfo:
+        await client.complete(make_request())
+    assert excinfo.value.retry_after == expected

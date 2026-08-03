@@ -95,7 +95,7 @@ class VarianceDecomposition:
     var_between: float
     var_within: float
     var_item_mean: float
-    share_between: float
+    share_between: float | None  # None when the data shows no variance at all (M9)
     n_required_items_current: int | None
     n_required_items_double: int | None
     n_required_items_limit: int | None
@@ -595,7 +595,9 @@ def decompose_variance(
         var_between=var_between,
         var_within=var_within,
         var_item_mean=var_item_mean,
-        share_between=var_between / total_now if total_now > 0.0 else 1.0,
+        # None, not 1.0, when there is no variance to apportion (M9): a share of
+        # 1.0 would claim item dominance over a perfectly constant diff table.
+        share_between=var_between / total_now if total_now > 0.0 else None,
         n_required_items_current=_required_items(mean_diff, sd_current, alpha=alpha),
         n_required_items_double=_required_items(mean_diff, sd_double, alpha=alpha),
         n_required_items_limit=_required_items(mean_diff, sd_limit, alpha=alpha),
@@ -755,7 +757,11 @@ def analyze_run(
         raise ValueError(f"run {run_id!r} has no judgments to analyze")
     samples = store.get_samples(run_id)
     conditions = store.get_conditions(run_id)
-    mode = judge["mode"]
+    # Hand-edited spec_json is the only path to a judge block without a mode; fail
+    # like audit_judge does, never with a bare KeyError (M9).
+    mode = judge.get("mode")
+    if mode is None:
+        raise ValueError(f"run {run_id!r} judge block is missing 'mode'")
     if mode == "pairwise":
         table = pairwise_item_scores(judgments, samples, conditions)
         replicates = pairwise_replicate_scores(judgments, samples, conditions)

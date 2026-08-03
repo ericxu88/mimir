@@ -1093,3 +1093,50 @@ async def test_concurrent_units_sharing_a_key_issue_one_client_call(store):
     assert len(texts) == 1  # rows agree with each other and with the cache row
     cached = store.cache_get(samples[0]["cache_key"])
     assert cached["text"] == samples[0]["response_text"]
+
+
+@pytest.mark.anyio
+async def test_retry_after_floors_the_backoff_sleep(store, monkeypatch):
+    # Provider backpressure (M9): a retry-after on the ClientError floors the
+    # jittered exponential sleep. Backoff here is at most 0.001s, so the recorded
+    # sleep must be exactly the 0.01s floor - deterministic despite the jitter.
+    monkeypatch.setattr(runner_mod, "_BASE_DELAY_S", 0.001)
+    monkeypatch.setattr(runner_mod, "_MAX_DELAY_S", 0.02)
+    sleeps = []
+
+    async def record(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runner_mod, "_sleep", record)
+    spec = make_spec(
+        variants=[{"name": "control", "system": "s", "user_template": "Answer: {input}"}],
+        items=[{"id": "q1", "input": "only one"}],
+    )
+    client = MockClient()
+    client.queue_error(429, retry_after=0.01)
+    run_id = await run_experiment(spec, store, client)
+    assert store.get_run(run_id)["status"] == "complete"
+    assert sleeps == [0.01]
+
+
+@pytest.mark.anyio
+async def test_retry_after_is_capped_at_max_delay(store, monkeypatch):
+    # The 60s cap is now load-bearing: an absurd provider retry-after cannot make
+    # a unit sleep past _MAX_DELAY_S.
+    monkeypatch.setattr(runner_mod, "_BASE_DELAY_S", 0.001)
+    monkeypatch.setattr(runner_mod, "_MAX_DELAY_S", 0.02)
+    sleeps = []
+
+    async def record(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runner_mod, "_sleep", record)
+    spec = make_spec(
+        variants=[{"name": "control", "system": "s", "user_template": "Answer: {input}"}],
+        items=[{"id": "q1", "input": "only one"}],
+    )
+    client = MockClient()
+    client.queue_error(429, retry_after=1000.0)
+    run_id = await run_experiment(spec, store, client)
+    assert store.get_run(run_id)["status"] == "complete"
+    assert sleeps == [0.02]
