@@ -3,7 +3,16 @@
 #
 #   mimir run examples/quickstart.yaml --mock
 #
-# Then: mimir analyze <run-id>   (add --html for the static report)
+# This spec COLLECTS SAMPLES ONLY — it has no judge, so there is nothing to score
+# and `mimir analyze` will exit 1 with "no judge configured". To get statistics or
+# a judge report card, run the judged spec with a real API key:
+#
+#   mimir run examples/judged.yaml            # needs ANTHROPIC_API_KEY
+#   mimir analyze <run-id>                    # add --html for the static report
+#   mimir audit-judge <run-id>
+#
+# (Under --mock the canned text never parses as a verdict, so a judged run ends
+# `failed` by design — see docs/PROGRESS.md.)
 name: quickstart-greeting-tone
 description: Does a warmer system prompt change answer quality?
 variants:

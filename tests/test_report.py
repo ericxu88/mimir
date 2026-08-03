@@ -171,9 +171,12 @@ friendly vs control (diff = friendly - control)
   mean control:     0.375
   mean friendly:    0.625
   mean diff:        0.250
-  95% CI:           [0.125, 0.375]
+  95% CI:           [0.125, 0.375] (studentized bootstrap)
   p-value:          0.1250 (exhaustive, 16 permutations)
-  power:            23 items needed for 80% power (19 more than paired)"""
+  note:             4 items cannot reach significance at alpha=0.05 (smallest achievable p = 0.1250)
+  power:            23 items needed for 80% power (19 more than paired)
+
+interval: studentized bootstrap; p-value: sign-flip permutation - they can disagree"""
 
 
 def test_render_analysis_text_golden():
@@ -443,7 +446,10 @@ def test_variance_rows_rendered_when_present():
     text = render_analysis_text(
         make_result(comparisons=[make_comparison(variance=make_decomposition())])
     )
-    assert "  variance split:   item 0.000, sampling 32.000 (2.0 samples per item)" in text
+    assert (
+        "  variance split:   item 0.000, replicate noise 32.000"
+        " (paired-difference scale, 2.0 samples per item)" in text
+    )
     assert (
         "  allocation:       more samples per item (63 items at 4.0 samples, 2 at unlimited)"
         in text
@@ -470,8 +476,10 @@ def test_score_variance_shares_line_gated():
 
 
 def test_render_analysis_text_golden_still_byte_identical():
-    # The M5 golden is the regression gate for every M7 report change: a default
-    # single-comparison result renders EXACTLY as before.
+    # The golden is the regression gate for every later report change. M8
+    # deliberately re-cut it (interval method named, unestimable intervals
+    # withheld, resolution note, procedures disclosure); M7's promise that the
+    # M5 text stayed byte-identical is superseded and recorded in PROGRESS.
     assert render_analysis_text(make_result(), status="complete") == GOLDEN_ANALYSIS
 
 
@@ -489,8 +497,67 @@ def test_render_html_variance_and_shares_rows_no_new_figures():
         mode="rubric",
     )
     out = render_html(result)
-    assert "<th>variance (item)</th><td>0.000</td>" in out
-    assert "<th>variance (sampling)</th><td>32.000</td>" in out
+    # M8/M4: both blocks name their scale, so the per-difference components and
+    # the raw-score shares can no longer be read as contradicting each other.
+    assert "<th>variance, item (diff scale)</th><td>0.000</td>" in out
+    assert "<th>variance, replicate noise (diff scale)</th><td>32.000</td>" in out
     assert "<th>allocation</th>" in out
-    assert "variance shares: condition 25.0%, item 50.0%, noise 25.0%" in out
+    assert "variance shares (raw-score scale): condition 25.0%, item 50.0%, noise 25.0%" in out
     assert out.count("<figure") == 2  # no new figures, ever
+
+
+# --- M8/C2+C3: interval method, withheld intervals, resolution disclosure ---------
+
+
+def test_render_analysis_text_labels_the_interval_method():
+    assert "(studentized bootstrap)" in render_analysis_text(make_result())
+
+
+def test_render_analysis_text_withholds_an_unestimable_interval():
+    result = make_result(comparisons=[make_comparison(ci_low=None, ci_high=None)])
+    text = render_analysis_text(result)
+    assert "95% CI:           not estimable (every difference identical)" in text
+    assert "n/a" not in text  # never a bracketed [n/a, n/a]
+
+
+def test_render_analysis_text_warns_when_the_design_cannot_reach_significance():
+    # The fixture has 4 items judged exhaustively: the smallest achievable p is
+    # 2/2**4 = 0.125, so no result can ever clear alpha=0.05. Saying nothing would
+    # let a user read "not significant" as evidence of no effect.
+    text = render_analysis_text(make_result())
+    assert "cannot reach significance at alpha=0.05" in text
+    assert "0.1250" in text
+
+
+def test_render_analysis_text_omits_the_warning_when_the_design_can_reject():
+    comparison = make_comparison(n_items=12, n_permutations=2**12, p_value=0.001)
+    text = render_analysis_text(make_result(comparisons=[comparison]))
+    assert "cannot reach significance" not in text
+
+
+def test_render_analysis_text_discloses_that_ci_and_test_differ():
+    assert "they can disagree" in render_analysis_text(make_result())
+
+
+def test_render_html_withholds_an_unestimable_interval_and_names_the_method():
+    out = render_html(make_result(comparisons=[make_comparison(ci_low=None, ci_high=None)]))
+    assert "not estimable" in out
+    assert "studentized" in out
+
+
+def test_render_html_warns_when_the_design_cannot_reach_significance():
+    assert "cannot reach significance" in render_html(make_result())
+
+
+def test_power_row_names_the_family_adjusted_alpha():
+    # M8/M2: a multi-arm verdict uses a corrected p, so the budget must be planned
+    # at the same stringency — and the report has to say which alpha that was.
+    comparison = make_comparison(
+        power_alpha=0.05 / 3, n_comparisons=3, p_value_corrected=0.06, correction_method="holm"
+    )
+    text = render_analysis_text(make_result(comparisons=[comparison]))
+    assert "planned at alpha=0.01667 for 3 comparisons" in text
+
+
+def test_power_row_omits_the_alpha_note_for_a_lone_comparison():
+    assert "planned at alpha" not in render_analysis_text(make_result())

@@ -41,7 +41,8 @@ _VERDICT_VALUE = {"A": 1.0, "B": 0.0, "TIE": 0.5}
 # z_a = 1.959963984540054, z_p = 0.8416212335729143 (stdlib inverse normal CDF).
 # The SUM is hoisted — not the squares — so _required_items keeps the exact float
 # expression ((z_a + z_p) * sd / |mean|) ** 2 pinned by the M3 power oracles.
-_Z_SUM = NormalDist().inv_cdf(1.0 - ALPHA / 2.0) + NormalDist().inv_cdf(TARGET_POWER)
+_Z_POWER = NormalDist().inv_cdf(TARGET_POWER)
+_Z_SUM = NormalDist().inv_cdf(1.0 - ALPHA / 2.0) + _Z_POWER
 
 
 @dataclass(frozen=True)
@@ -135,8 +136,8 @@ class Comparison:
     mean_a: float  # means over the paired items only
     mean_b: float
     mean_diff: float
-    ci_low: float
-    ci_high: float
+    ci_low: float | None  # None when not estimable (see studentized_ci)
+    ci_high: float | None
     ci_level: float
     p_value: float
     p_method: Literal["exhaustive", "monte_carlo"]
@@ -147,8 +148,12 @@ class Comparison:
     n_required_items: int | None  # total items for TARGET_POWER at the observed effect
     n_additional_items: int | None  # max(0, required - n_items); None when not estimable
     seed: int
+    # M8: the level the power plan was computed at — ALPHA/m for a multi-arm family,
+    # so the budget matches the corrected verdict. NOT the verdict's own alpha.
+    power_alpha: float = ALPHA
     # M7 family/decomposition fields, DEFAULTED so hand-built Comparisons (report
     # tests) stay legal; analyze_run always populates the first three.
+    ci_method: str = "studentized"  # M8: bootstrap-t; see studentized_ci
     p_value_corrected: float | None = None  # family-corrected p; == p_value when m == 1
     correction_method: Literal["bh", "holm"] | None = None
     n_comparisons: int = 1  # family size m = len(result.comparisons)
@@ -201,6 +206,54 @@ def bootstrap_ci(
     return (float(lo), float(hi))
 
 
+def studentized_ci(
+    diffs: Sequence[float] | np.ndarray,
+    *,
+    n_resamples: int = DEFAULT_RESAMPLES,
+    seed: int = 0,
+) -> tuple[float, float] | tuple[None, None]:
+    """Studentized (bootstrap-t) CI on the mean of the paired differences.
+
+    Each resample is divided by its OWN standard error, so the interval accounts
+    for the scale uncertainty that makes a plain percentile bootstrap under-cover
+    at small n — the regime this harness runs in. Measured coverage of a nominal
+    95% interval (normal data): 95.3% at n=6 and 93.7% at n=12, against 84.3% and
+    90.0% for the percentile interval; on skewed data the gap is wider still
+    (91.3% vs 78.7% at n=6). BCa was measured first and rejected: it corrects bias
+    and skewness, not scale, and gained nothing for a mean (85.5% vs 85.2% at n=6).
+
+    Returns (None, None) when the interval is not estimable rather than inventing
+    one: fewer than 2 items, or a zero standard error (every difference identical —
+    routine with quantized pairwise scores, where a percentile bootstrap would
+    return a zero-width interval that claims infinite precision).
+    """
+    d = _as_diffs(diffs)
+    if n_resamples < 1:
+        raise ValueError("n_resamples must be >= 1")
+    n = d.size
+    if n < 2:
+        return (None, None)
+    mean = float(np.mean(d))
+    se = float(np.std(d, ddof=1)) / math.sqrt(n)
+    if se == 0.0:
+        return (None, None)
+    rng = np.random.default_rng(seed)
+    resamples = d[rng.integers(0, n, size=(n_resamples, n))]
+    boot_means = resamples.mean(axis=1)
+    boot_se = resamples.std(axis=1, ddof=1) / math.sqrt(n)
+    # A resample that drew one item n times has zero spread and an undefined t;
+    # dropping those is the standard treatment (probability n^-(n-1), negligible).
+    usable = boot_se > 0.0
+    if not usable.any():
+        return (None, None)
+    t = (boot_means[usable] - mean) / boot_se[usable]
+    tail = (1.0 - CONFIDENCE) / 2.0
+    # The studentized interval inverts the t distribution, so the UPPER quantile
+    # sets the LOWER endpoint.
+    t_hi, t_lo = np.quantile(t, [1.0 - tail, tail], method="linear")
+    return (float(mean - t_hi * se), float(mean - t_lo * se))
+
+
 def sign_flip_pvalue(
     diffs: Sequence[float] | np.ndarray,
     *,
@@ -235,19 +288,24 @@ def sign_flip_pvalue(
     return (1 + count) / (1 + n_permutations)
 
 
-def required_items_for_power(diffs: Sequence[float] | np.ndarray) -> int | None:
-    """Total items needed to detect the observed effect at TARGET_POWER, two-sided ALPHA.
+def required_items_for_power(
+    diffs: Sequence[float] | np.ndarray, *, alpha: float = ALPHA
+) -> int | None:
+    """Total items needed to detect the observed effect at TARGET_POWER, two-sided alpha.
 
-    Normal approximation for the paired mean. Returns None when not estimable:
-    zero observed mean (infinite n) or n < 2 (ddof=1 sd undefined).
+    Normal approximation for the paired mean, planned at the OBSERVED effect (the
+    brief's "N more samples to detect the current effect"), so it inherits that
+    effect's noise. Returns None when not estimable: zero observed mean (infinite n)
+    or n < 2 (ddof=1 sd undefined). `alpha` is the per-comparison level; a multi-arm
+    run passes its family-adjusted alpha so the plan matches the corrected verdict.
     """
     d = _as_diffs(diffs)
     if d.size < 2:
         return None
-    return _required_items(float(np.mean(d)), float(np.std(d, ddof=1)))
+    return _required_items(float(np.mean(d)), float(np.std(d, ddof=1)), alpha=alpha)
 
 
-def _required_items(mean: float, sd: float) -> int | None:
+def _required_items(mean: float, sd: float, *, alpha: float = ALPHA) -> int | None:
     """Items for TARGET_POWER at effect `mean` with per-item sd `sd`; None if not
     estimable.
 
@@ -260,8 +318,10 @@ def _required_items(mean: float, sd: float) -> int | None:
     """
     if abs(mean) <= 1e-12 * max(1.0, sd):
         return None
+    # The default path keeps the hoisted sum so the M3 oracles stay byte-identical.
+    z_sum = _Z_SUM if alpha == ALPHA else NormalDist().inv_cdf(1.0 - alpha / 2.0) + _Z_POWER
     # A paired analysis needs at least 2 items, so a zero-variance effect floors there.
-    return max(2, math.ceil((_Z_SUM * sd / abs(mean)) ** 2))
+    return max(2, math.ceil((z_sum * sd / abs(mean)) ** 2))
 
 
 def _as_pvalues(p_values: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -494,7 +554,7 @@ def replicate_diffs(
 
 
 def decompose_variance(
-    diffs_by_item: dict[str, Sequence[float]], *, mean_diff: float
+    diffs_by_item: dict[str, Sequence[float]], *, mean_diff: float, alpha: float = ALPHA
 ) -> VarianceDecomposition | None:
     """Split replicate-level per-item differences; None when not separable
     (fewer than 2 items, or no item has >= 2 replicates — the n_samples: 1 case).
@@ -518,6 +578,16 @@ def decompose_variance(
     inv_r = float(np.mean(1.0 / counts))  # E[MS_between] = var_b + var_w * mean(1/r_i)
     var_between = max(0.0, var_item_mean - var_within * inv_r)
     total_now = var_between + var_within * inv_r
+    # M8/M3: the CURRENT rung must be the same quantity the headline power row uses
+    # (the ddof-1 variance of the per-item mean diffs). When var_between clips to 0
+    # — the ordinary noise-dominated case — total_now exceeds var_item_mean, and
+    # planning off it put the ladder on an inflated scale that disagreed with the
+    # headline and could rank "double the samples" ABOVE "current". Each rung is
+    # additionally floored by the one before it, so the ladder can never claim that
+    # buying more samples per item increases the items required.
+    sd_current = math.sqrt(var_item_mean)
+    sd_double = min(sd_current, math.sqrt(var_between + var_within * inv_r / 2.0))
+    sd_limit = min(sd_double, math.sqrt(var_between))
     return VarianceDecomposition(
         n_items=len(items),
         n_items_with_replicates=int((counts > 1).sum()),
@@ -526,11 +596,9 @@ def decompose_variance(
         var_within=var_within,
         var_item_mean=var_item_mean,
         share_between=var_between / total_now if total_now > 0.0 else 1.0,
-        n_required_items_current=_required_items(mean_diff, math.sqrt(total_now)),
-        n_required_items_double=_required_items(
-            mean_diff, math.sqrt(var_between + var_within * inv_r / 2.0)
-        ),
-        n_required_items_limit=_required_items(mean_diff, math.sqrt(var_between)),
+        n_required_items_current=_required_items(mean_diff, sd_current, alpha=alpha),
+        n_required_items_double=_required_items(mean_diff, sd_double, alpha=alpha),
+        n_required_items_limit=_required_items(mean_diff, sd_limit, alpha=alpha),
         # Tie -> more_items: more items always helps, more replicates can never
         # shrink var_between, so items are the safe default when the split is a wash.
         recommendation=(
@@ -601,6 +669,7 @@ def _compare(
     n_resamples: int,
     n_permutations: int,
     seed: int,
+    power_alpha: float = ALPHA,
     replicate_diffs_by_item: dict[str, tuple[float, ...]] | None = None,
 ) -> Comparison:
     # Sorting is load-bearing: sample rows arrive in task-completion order, and a
@@ -610,16 +679,22 @@ def _compare(
         raise ValueError(f"comparison {variant_a!r} vs {variant_b!r} has no paired items")
     diffs = tuple(float(scores_b[item] - scores_a[item]) for item in item_ids)
     n = len(item_ids)
-    ci_low, ci_high = bootstrap_ci(diffs, n_resamples=n_resamples, seed=seed)
+    ci_low, ci_high = studentized_ci(diffs, n_resamples=n_resamples, seed=seed)
     p_value = sign_flip_pvalue(diffs, n_permutations=n_permutations, seed=seed)
     exhaustive = n <= EXHAUSTIVE_MAX_N
-    required = required_items_for_power(diffs)
+    required = required_items_for_power(diffs, alpha=power_alpha)
     mean_diff = float(np.mean(diffs))
-    variance = (
-        None
-        if replicate_diffs_by_item is None
-        else decompose_variance(replicate_diffs_by_item, mean_diff=mean_diff)
-    )
+    if replicate_diffs_by_item is None:
+        variance = None
+    else:
+        # M8/M3: decompose over exactly the items this comparison paired, so the
+        # split and the headline power row describe the same dataset.
+        paired = {
+            item: replicate_diffs_by_item[item]
+            for item in item_ids
+            if item in replicate_diffs_by_item
+        }
+        variance = decompose_variance(paired, mean_diff=mean_diff, alpha=power_alpha)
     return Comparison(
         variant_a=variant_a,
         variant_b=variant_b,
@@ -642,6 +717,7 @@ def _compare(
         n_required_items=required,
         n_additional_items=None if required is None else max(0, required - n),
         seed=seed,
+        power_alpha=power_alpha,
         variance=variance,
     )
 
@@ -691,6 +767,10 @@ def analyze_run(
     else:
         raise ValueError(f"unknown judge mode {mode!r}")
     variant_names = [row["variant_name"] for row in conditions]  # declared order
+    pairs = list(combinations(variant_names, 2))
+    # The family is known before the comparisons are built, so the power plan can be
+    # made at the same stringency the corrected verdict will be judged at.
+    power_alpha = ALPHA / len(pairs) if len(pairs) > 1 else ALPHA
     comparisons = [
         _compare(
             variant_a,
@@ -701,17 +781,24 @@ def analyze_run(
             n_resamples=n_resamples,
             n_permutations=n_permutations,
             seed=seed,
+            power_alpha=power_alpha,
             replicate_diffs_by_item=replicate_diffs(replicates, variant_a, variant_b),
         )
-        for variant_a, variant_b in combinations(variant_names, 2)
+        for variant_a, variant_b in pairs
     ]
     # The family statistic is only knowable once every pair is built, and
     # Comparison is frozen: build, then rewrite the three family fields in place.
-    adjusted = _CORRECTIONS[correction]([c.p_value for c in comparisons])
-    comparisons = [
-        replace(c, p_value_corrected=q, correction_method=correction, n_comparisons=len(adjusted))
-        for c, q in zip(comparisons, adjusted, strict=True)
-    ]
+    # A one-variant run is legal (spec.py allows min_length=1 and the exactly-2 rule
+    # is pairwise-only), and C(1,2) is empty — there is no family to correct, so the
+    # pass is skipped rather than handing an empty list to the p-value validator.
+    if comparisons:
+        adjusted = _CORRECTIONS[correction]([c.p_value for c in comparisons])
+        comparisons = [
+            replace(
+                c, p_value_corrected=q, correction_method=correction, n_comparisons=len(adjusted)
+            )
+            for c, q in zip(comparisons, adjusted, strict=True)
+        ]
     return AnalysisResult(
         run_id=run_id,
         experiment_name=run["experiment_name"],

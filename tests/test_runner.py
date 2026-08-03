@@ -423,7 +423,8 @@ async def test_pairwise_judge_scores_both_orders_and_caches(store):
                 temperature=0.0,
                 max_tokens=512,
                 seed=0,
-                sample_index=0,
+                # M8/C1: replicate 0, so the coordinate is the order bit alone.
+                sample_index=0 if judgment["position_order"] == "ab" else 1,
             )
         )
         assert judgment["cache_key"] == expected_key
@@ -965,3 +966,130 @@ async def test_provider_braces_render_literally_in_judge_prompts(store):
     judge_calls = [r for r in client.calls if r.model == "judge-model"]
     assert judge_calls
     assert all(hostile in r.user for r in judge_calls)
+
+
+# --- M8/C1: judge units are independently keyed -----------------------------------
+
+
+@pytest.mark.anyio
+async def test_judge_units_get_independent_cache_keys_per_replicate_and_order(store):
+    # Two variants that answer IDENTICALLY render byte-identical 'ab'/'ba' prompts,
+    # and a deterministic model repeats its text across replicates. Under the pre-M8
+    # coordinate (sample_index=0 for EVERY judge unit) all four judge units of an
+    # item collapsed onto one cache entry: the judge was asked once and its single
+    # answer was reused as if it were independent draws, which zeroes the replicate
+    # noise M7 measures and pins the flip rate at 1.0.
+    spec = make_spec(n_samples=2, judge={"model": "judge-model", "mode": "pairwise"})
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "A")
+    client.add_rule(lambda request: request.model != "judge-model", "SAME")
+    run_id = await run_experiment(spec, store, client)
+
+    judgments = store.get_judgments(run_id)
+    assert len(judgments) == 8  # 2 items x 2 replicates x 2 orders
+    assert len({j["cache_key"] for j in judgments}) == 8
+    judge_calls = [c for c in client.calls if c.model == "judge-model"]
+    assert len(judge_calls) == 8  # the judge is genuinely asked once per unit
+
+
+@pytest.mark.anyio
+async def test_judge_payload_sample_index_coordinates_are_pinned(store):
+    # The literal coordinates ARE the contract: pairwise = 2*replicate + order bit
+    # ('ab' -> 0, 'ba' -> 1), rubric = replicate. A "nicer" derivation would break
+    # the replicate-0 back-compat pinned below.
+    pairwise = make_spec(n_samples=2, judge={"model": "judge-model", "mode": "pairwise"})
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "A")
+    await run_experiment(pairwise, store, client)
+    judge_idx = sorted({c.sample_index for c in client.calls if c.model == "judge-model"})
+    assert judge_idx == [0, 1, 2, 3]
+
+    rubric = make_spec(n_samples=3, judge={"model": "judge-model", "mode": "rubric"})
+    client2 = MockClient()
+    client2.add_rule(lambda request: request.model == "judge-model", "7")
+    await run_experiment(rubric, store, client2)
+    assert sorted({c.sample_index for c in client2.calls if c.model == "judge-model"}) == [0, 1, 2]
+
+
+@pytest.mark.anyio
+async def test_replicate_zero_ab_judge_key_matches_pre_m8(store):
+    # Back-compat: replicate 0 in 'ab' order keeps sample_index=0, so judge cache
+    # entries written before M8 still hit; every other unit re-executes (re-spent,
+    # never wrong).
+    spec = make_spec(n_samples=2, judge={"model": "judge-model", "mode": "pairwise"})
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "A")
+    run_id = await run_experiment(spec, store, client)
+
+    samples = {row["id"]: row for row in store.get_samples(run_id)}
+    text_by_id = {row["id"]: row["response_text"] for row in samples.items() and samples.values()}
+    template = spec.judge.resolved_prompt_template()
+    input_of = {"q1": "Why is the sky blue?", "q2": "Why is grass green?"}
+    checked = 0
+    for judgment in store.get_judgments(run_id):
+        if judgment["position_order"] != "ab":
+            continue
+        if samples[judgment["sample_a_id"]]["sample_index"] != 0:
+            continue
+        expected = cache_key(
+            build_payload(
+                model="judge-model",
+                system="",
+                user=template.format(
+                    input=input_of[judgment["item_id"]],
+                    response_a=text_by_id[judgment["sample_a_id"]],
+                    response_b=text_by_id[judgment["sample_b_id"]],
+                ),
+                temperature=0.0,
+                max_tokens=512,
+                seed=0,
+                sample_index=0,
+            )
+        )
+        assert judgment["cache_key"] == expected
+        checked += 1
+    assert checked == 2  # one per item
+
+
+# --- M8/M5: concurrent units sharing a cache key ----------------------------------
+
+
+@pytest.mark.anyio
+async def test_concurrent_units_sharing_a_key_issue_one_client_call(store):
+    # Two variants with identical system + template render identical payloads, so
+    # both units share one cache key. They used to BOTH call the provider, and
+    # INSERT OR IGNORE kept only the first envelope — leaving each row pointing at a
+    # cache entry whose text differs from the row's own response_text.
+    class CountingClient:
+        def __init__(self):
+            self.calls_made = 0
+
+        async def complete(self, request):
+            self.calls_made += 1
+            await asyncio.sleep(0.01)  # hold the slot so the second unit overlaps
+            return CompletionResponse(
+                text=f"resp-{self.calls_made}",
+                raw={},
+                input_tokens=1,
+                output_tokens=1,
+                latency_ms=1.0,
+                model=request.model,
+            )
+
+    spec = make_spec(
+        variants=[
+            {"name": "a", "system": "same", "user_template": "Q: {input}"},
+            {"name": "b", "system": "same", "user_template": "Q: {input}"},
+        ],
+        items=[{"id": "q1", "input": "x"}],
+    )
+    client = CountingClient()
+    run_id = await run_experiment(spec, store, client)
+
+    samples = store.get_samples(run_id)
+    assert len({row["cache_key"] for row in samples}) == 1  # genuinely one request
+    assert client.calls_made == 1
+    texts = {row["response_text"] for row in samples}
+    assert len(texts) == 1  # rows agree with each other and with the cache row
+    cached = store.cache_get(samples[0]["cache_key"])
+    assert cached["text"] == samples[0]["response_text"]

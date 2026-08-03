@@ -55,9 +55,7 @@ class AnthropicClient:
             raise ClientError(response.status_code, _error_message(response))
 
         data = response.json()
-        text = "".join(
-            block["text"] for block in data["content"] if block.get("type") == "text"
-        )
+        text = "".join(block["text"] for block in data["content"] if block.get("type") == "text")
         return CompletionResponse(
             text=text,
             raw=data,

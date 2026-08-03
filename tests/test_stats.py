@@ -33,6 +33,7 @@ from mimir.stats import (
     rubric_replicate_scores,
     score_variance_shares,
     sign_flip_pvalue,
+    studentized_ci,
 )
 from mimir.store import Store
 
@@ -593,7 +594,7 @@ def test_analyze_run_matches_math_layer_on_known_pairwise_data(store):
     assert comparison.diffs == (-1.0, 0.0)
     assert comparison.mean_diff == -0.5
     # Layer consistency under the same seed — no hardcoding of resampling values.
-    assert (comparison.ci_low, comparison.ci_high) == bootstrap_ci([-1.0, 0.0], seed=0)
+    assert (comparison.ci_low, comparison.ci_high) == studentized_ci([-1.0, 0.0], seed=0)
     # Exhaustive n=2 on [-1, 0]: all 4 sign patterns give |sum| = 1 (the 0 never
     # moves) -> p = 4/4 = 1.0.
     assert comparison.p_value == 1.0
@@ -630,7 +631,9 @@ def test_analyze_run_always_a_data_degenerates(store):
             )
     comparison = analyze_run(store, run_id).comparisons[0]
     assert comparison.mean_diff == 0.0
-    assert (comparison.ci_low, comparison.ci_high) == (0.0, 0.0)
+    # M8: every difference is identical, so the standard error is exactly zero and
+    # the interval is withheld rather than reported as zero-width.
+    assert (comparison.ci_low, comparison.ci_high) == (None, None)
     assert comparison.p_value == 1.0
     assert comparison.n_required_items is None
     assert comparison.n_additional_items is None
@@ -657,7 +660,7 @@ def test_analyze_run_rubric_hand_computed_stats(store):
     # Power hand-check (verified): mean 1.0, sd 2.0 -> required 32, additional 29.
     assert comparison.n_required_items == 32
     assert comparison.n_additional_items == 29
-    assert (comparison.ci_low, comparison.ci_high) == bootstrap_ci([-1.0, 1.0, 3.0], seed=0)
+    assert (comparison.ci_low, comparison.ci_high) == studentized_ci([-1.0, 1.0, 3.0], seed=0)
 
 
 def test_analyze_run_constant_diffs_additional_clamped_to_zero(store):
@@ -668,7 +671,9 @@ def test_analyze_run_constant_diffs_additional_clamped_to_zero(store):
             sid = add_ok_sample(store, run_id, cond[name], item)
             add_rubric_judgment(store, run_id, item, sample_id=sid, score=value)
     comparison = analyze_run(store, run_id).comparisons[0]
-    assert (comparison.ci_low, comparison.ci_high) == (2.0, 2.0)
+    # M8: every difference is identical, so the standard error is exactly zero and
+    # the interval is withheld rather than reported as zero-width.
+    assert (comparison.ci_low, comparison.ci_high) == (None, None)
     assert comparison.p_value == 0.25  # 2/8: only the all-same-sign patterns tie
     assert comparison.n_required_items == 2
     assert comparison.n_additional_items == 0
@@ -762,7 +767,9 @@ async def test_analyze_run_end_to_end_with_runner(store):
     assert result.scores["control"] == {"q1": 0.5, "q2": 0.5}
     assert result.scores["friendly"] == {"q1": 0.5, "q2": 0.5}
     assert comparison.diffs == (0.0, 0.0)
-    assert (comparison.ci_low, comparison.ci_high) == (0.0, 0.0)
+    # M8: every difference is identical, so the standard error is exactly zero and
+    # the interval is withheld rather than reported as zero-width.
+    assert (comparison.ci_low, comparison.ci_high) == (None, None)
     assert comparison.p_value == 1.0
 
 
@@ -807,7 +814,9 @@ async def test_analyze_run_position_sensitive_judge_grounds_mapping_direction(st
     comparison = result.comparisons[0]
     assert comparison.diffs == (-1.0, -1.0)  # friendly - control
     assert comparison.mean_diff == -1.0
-    assert (comparison.ci_low, comparison.ci_high) == (-1.0, -1.0)
+    # M8: every difference is identical, so the standard error is exactly zero and
+    # the interval is withheld rather than reported as zero-width.
+    assert (comparison.ci_low, comparison.ci_high) == (None, None)
     assert comparison.p_value == 0.5  # constant n=2: 2/4 patterns tie
 
 
@@ -1011,7 +1020,9 @@ async def test_crn_seed_honoring_client_zero_variance_under_null(store):
     comparison = analyze_run(store, run_id).comparisons[0]
     assert comparison.diffs == (0.0, 0.0, 0.0, 0.0)  # exactly zero, not approx
     assert comparison.mean_diff == 0.0
-    assert (comparison.ci_low, comparison.ci_high) == (0.0, 0.0)
+    # M8: every difference is identical, so the standard error is exactly zero and
+    # the interval is withheld rather than reported as zero-width.
+    assert (comparison.ci_low, comparison.ci_high) == (None, None)
     assert comparison.p_value == 1.0
 
 
@@ -1305,15 +1316,19 @@ def test_decompose_item_dominated_recommends_more_items():
 def test_decompose_noise_dominated_recommends_more_samples():
     # Item means 0, 1, 2 -> var_item_mean = 1; per-item ss = 32 each, pooled
     # var_within = 96/3 = 32; var_between = max(0, 1 - 16) = 0 (clamped).
-    # Deliberately the SAME current requirement as the item-dominated case (126)
-    # with the opposite advice: ceil(K*16) = 126, ceil(K*8) = 63, limit floors at 2.
+    # M8/M3 re-cut these numbers: the ladder used to plan off the CLIPPED scale
+    # (sd = sqrt(var_within * inv_r) = 4 -> 126 items) while the headline power row
+    # planned off var_item_mean (sd = 1 -> 8 items), so one report carried two
+    # different answers to "how many items do I need?". The current rung is now the
+    # headline's own quantity, and each later rung is floored by the one before it,
+    # so the ladder can never rank "double the samples" above "current".
     v = decompose_variance({"q1": [-4.0, 4.0], "q2": [-3.0, 5.0], "q3": [-2.0, 6.0]}, mean_diff=1.0)
     assert v.var_item_mean == 1.0
     assert v.var_within == 32.0
     assert v.var_between == 0.0
     assert v.share_between == 0.0
-    assert v.n_required_items_current == 126
-    assert v.n_required_items_double == 63
+    assert v.n_required_items_current == required_items_for_power([0.0, 1.0, 2.0]) == 8
+    assert v.n_required_items_double == 8  # clamped: more samples cannot need more items
     assert v.n_required_items_limit == 2
     assert v.recommendation == "more_samples_per_item"
 
@@ -1485,10 +1500,7 @@ def test_score_variance_shares_incomplete_items_dropped():
 def test_score_variance_shares_none_when_degenerate():
     assert score_variance_shares(_shares_table({"only": {"q1": {0: 1.0}, "q2": {0: 2.0}}})) is None
     assert (
-        score_variance_shares(
-            _shares_table({"a": {"q1": {0: 1.0}}, "b": {"q1": {0: 2.0}}})
-        )
-        is None
+        score_variance_shares(_shares_table({"a": {"q1": {0: 1.0}}, "b": {"q1": {0: 2.0}}})) is None
     )
 
 
@@ -1639,3 +1651,146 @@ def test_analyze_run_determinism_with_replicates_and_correction(store):
     # ScoreVarianceShares dataclasses and the correction pass.
     run_id = seed_rubric_replicated(store)
     assert analyze_run(store, run_id) == analyze_run(store, run_id)
+
+
+# --- M8: empty family, and the ulp tolerance that keeps the identity countable ----
+
+
+def test_sign_flip_tolerance_keeps_the_identity_pattern_countable():
+    # Rubric means over n_samples=3 land on thirds, which are not representable, and
+    # `signs @ d` sums them in a different order than np.sum(d). Without the ulp
+    # tolerance the identity pattern misses its OWN comparison and the exhaustive
+    # test returns 0.0 — impossible for a test that always counts itself (the
+    # module guarantees p >= 2^-n). Verified: this vector gives 0.0 with tau = 0.
+    d = [
+        1.666666666666666,
+        2.333333333333333,
+        3.6666666666666665,
+        0.3333333333333335,
+        0.3333333333333335,
+    ]
+    assert sign_flip_pvalue(d) == 2 / 2**5  # the identity pattern and its mirror
+
+
+@pytest.mark.anyio
+async def test_analyze_run_single_variant_rubric_has_no_family_to_correct(store):
+    # A one-variant rubric spec is legal (spec.py Field(min_length=1); the exactly-2
+    # rule is pairwise-only) and the runner completes it. M7's correction pass must
+    # not turn C(1,2) == 0 comparisons into "p_values is empty".
+    spec = ExperimentSpec.model_validate(
+        {
+            "name": "solo",
+            "variants": [{"name": "only", "system": "s", "user_template": "Q: {input}"}],
+            "dataset": {"items": [{"id": f"q{i}", "input": f"i{i}"} for i in range(3)]},
+            "sampling": {"model": "m"},
+            "n_samples": 1,
+            "limits": {"concurrency": 2, "requests_per_minute": 100_000},
+            "judge": {"model": "judge-model", "mode": "rubric"},
+        }
+    )
+    client = MockClient()
+    client.add_rule(lambda request: request.model == "judge-model", "7")
+    run_id = await run_experiment(spec, store, client)
+    assert store.get_run(run_id)["status"] == "complete"
+
+    result = analyze_run(store, run_id)
+    assert result.comparisons == []
+    assert result.scores["only"] == {"q0": 7.0, "q1": 7.0, "q2": 7.0}
+    assert result.correction_method == "holm"
+
+
+# --- M8/C2: the studentized (bootstrap-t) interval --------------------------------
+
+
+def test_studentized_ci_not_estimable_for_constant_or_single_diffs():
+    # Constant diffs are routine with quantized pairwise scores; a zero-width
+    # "95% CI" asserts infinite precision, so the interval is withheld instead.
+    assert studentized_ci([1.0] * 5) == (None, None)
+    assert studentized_ci([1.0]) == (None, None)
+
+
+def test_studentized_ci_brackets_the_point_estimate():
+    d = [0.1, 0.4, -0.2, 0.9, 0.3, 0.05]
+    lo, hi = studentized_ci(d, n_resamples=2000, seed=0)
+    assert lo < sum(d) / len(d) < hi
+
+
+def test_studentized_ci_is_deterministic_for_a_seed():
+    d = [0.1, 0.4, -0.2, 0.9, 0.3, 0.05]
+    assert studentized_ci(d, seed=3) == studentized_ci(d, seed=3)
+
+
+@pytest.mark.parametrize("n", [pytest.param(6, id="n6"), pytest.param(12, id="n12")])
+def test_studentized_ci_recovers_nominal_coverage_where_percentile_fails(n):
+    # Pre-screened against this repo's numpy BEFORE pinning (seed 20260803, 300
+    # trials, B=800): n=6 -> studentized 0.953 vs percentile 0.843; n=12 ->
+    # studentized 0.937 vs percentile 0.900. The percentile bootstrap under-covers
+    # a labelled 95% interval at exactly the item counts this harness targets —
+    # that gap is why the interval changed. Never widen the band to make this pass.
+    rng = np.random.default_rng(20260803)
+    studentized = percentile = 0
+    for _ in range(300):
+        d = rng.normal(0.3, 1.0, n)
+        lo, hi = studentized_ci(d, n_resamples=800, seed=0)
+        studentized += lo <= 0.3 <= hi
+        lo_p, hi_p = bootstrap_ci(d, n_resamples=800, seed=0)
+        percentile += lo_p <= 0.3 <= hi_p
+    assert studentized / 300 >= 0.92
+    assert studentized > percentile
+
+
+def test_analyze_run_withholds_the_interval_when_every_diff_is_identical(store):
+    run_id, cond = make_run(store, mode="rubric")
+    for item in ("q1", "q2", "q3"):
+        for name, value in (("control", 5), ("treatment", 6)):
+            sid = add_ok_sample(store, run_id, cond[name], item)
+            add_rubric_judgment(store, run_id, item, sample_id=sid, score=value)
+    comparison = analyze_run(store, run_id).comparisons[0]
+    assert comparison.diffs == (1.0, 1.0, 1.0)
+    assert (comparison.ci_low, comparison.ci_high) == (None, None)
+    assert comparison.ci_method == "studentized"
+
+
+# --- M8/M2+M3: power planned at the family alpha, one estimator behind both rows ---
+
+
+def test_required_items_grows_under_a_family_adjusted_alpha():
+    # Pre-screened before pinning: [-0.5, 0.6, 1.4, 2.5] needs 13 items at the raw
+    # alpha and 17 at 0.05/3. A multi-arm run whose verdict uses a Holm-corrected p
+    # must plan at the same stringency, or it under-states the budget.
+    d = [-0.5, 0.6, 1.4, 2.5]
+    assert required_items_for_power(d) == 13
+    assert required_items_for_power(d, alpha=0.05 / 3) == 17
+
+
+def test_multi_arm_run_plans_power_at_the_corrected_alpha(store):
+    run_id, cond = make_run(store, mode="rubric", variants=("a", "b", "c"))
+    for item, scores in (("q1", (3, 5, 8)), ("q2", (4, 5, 7)), ("q3", (2, 6, 9))):
+        for name, value in zip(("a", "b", "c"), scores, strict=True):
+            sid = add_ok_sample(store, run_id, cond[name], item)
+            add_rubric_judgment(store, run_id, item, sample_id=sid, score=value)
+    result = analyze_run(store, run_id)
+    assert len(result.comparisons) == 3  # C(3,2)
+    assert all(c.power_alpha == pytest.approx(0.05 / 3) for c in result.comparisons)
+
+    two_arm, cond2 = make_run(store, mode="rubric")
+    for item in ("q1", "q2"):
+        for name, value in (("control", 3), ("treatment", 6)):
+            sid = add_ok_sample(store, two_arm, cond2[name], item)
+            add_rubric_judgment(store, two_arm, item, sample_id=sid, score=value)
+    single = analyze_run(store, two_arm).comparisons[0]
+    assert single.power_alpha == 0.05  # a lone comparison is its own family
+
+
+def test_allocation_ladder_is_monotone_and_matches_the_headline_power_row():
+    # Pre-screened against the shipped code, which returned current/double/limit =
+    # 349/175/2 next to a headline power row of 3 items: the ladder sat on the
+    # clipped (inflated) variance scale, so the report could claim that doubling
+    # the samples per item INCREASES the items needed.
+    diffs_by_item = {"q1": (-1.9, 2.1), "q2": (-1.5, 2.5), "q3": (-1.8, 2.2), "q4": (-1.6, 2.4)}
+    means = [sum(v) / len(v) for v in diffs_by_item.values()]
+    decomposition = decompose_variance(diffs_by_item, mean_diff=sum(means) / len(means))
+    assert decomposition.var_between == 0.0  # clipped: noise dominates
+    assert decomposition.n_required_items_current == required_items_for_power(means) == 3
+    assert decomposition.n_required_items_double <= decomposition.n_required_items_current
+    assert decomposition.n_required_items_limit <= decomposition.n_required_items_double

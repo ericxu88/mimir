@@ -38,3 +38,20 @@ def test_quickstart_runs_end_to_end_under_mock(tmp_path, capsys):
     captured = capsys.readouterr()
     assert " complete" in captured.out
     assert "samples: 24 (0 errors)" in captured.out  # 2 variants x 6 items x n_samples 2
+
+
+def test_quickstart_analyze_exits_with_the_documented_error(tmp_path, capsys):
+    # M8/M6: the example used to tell the reader to run `mimir analyze` next, which
+    # can never succeed on a judgeless run. The two halves were each tested and
+    # never composed, so the contradiction shipped. This pins the real behavior the
+    # header comment now documents.
+    db = tmp_path / "results.db"
+    assert main(["run", str(EXAMPLES / "quickstart.yaml"), "--db", str(db), "--mock"]) == 0
+    run_id = capsys.readouterr().out.split()[1]
+
+    assert main(["analyze", run_id, "--db", str(db)]) == 1
+    assert "no judge configured" in capsys.readouterr().err
+
+    header = (EXAMPLES / "quickstart.yaml").read_text(encoding="utf-8")
+    assert "COLLECTS SAMPLES ONLY" in header
+    assert "examples/judged.yaml" in header

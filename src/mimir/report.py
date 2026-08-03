@@ -119,13 +119,35 @@ def _p_value_text(c: Comparison, *, html: bool = False) -> str:
     return f"{c.p_value:.4f} ({c.p_method}, {c.n_permutations} permutations)"
 
 
+def _ci_text(c: Comparison) -> str:
+    """The interval, or an honest refusal — never a zero-width 95% interval."""
+    if c.ci_low is None or c.ci_high is None:
+        return "not estimable (every difference identical)"
+    return f"[{_fmt(c.ci_low)}, {_fmt(c.ci_high)}] ({c.ci_method} bootstrap)"
+
+
+def _resolution_note(c: Comparison) -> str | None:
+    """A permutation test over n items cannot return a p below 2/2**n; if that floor
+    is above alpha the design can never reject, and silence would read as evidence
+    of no effect."""
+    smallest = 2 / 2**c.n_items if c.p_method == "exhaustive" else 1 / (1 + c.n_permutations)
+    if smallest <= c.alpha:
+        return None
+    return (
+        f"{c.n_items} items cannot reach significance at alpha={c.alpha:g}"
+        f" (smallest achievable p = {smallest:.4f})"
+    )
+
+
 def _allocation_text(c: Comparison) -> tuple[str, str] | None:
     v = c.variance
     if v is None:
         return None
+    # M8/M4: name the scale — these are per-difference variance components, not the
+    # raw-score shares printed in the run-level block above.
     split = (
-        f"item {v.var_between:.3f}, sampling {v.var_within:.3f}"
-        f" ({v.mean_replicates:.1f} samples per item)"
+        f"item {v.var_between:.3f}, replicate noise {v.var_within:.3f}"
+        f" (paired-difference scale, {v.mean_replicates:.1f} samples per item)"
     )
     if v.recommendation == "more_samples_per_item":
         phrase = "more samples per item"
@@ -162,16 +184,23 @@ def _comparison_lines(c: Comparison) -> list[str]:
             f"{c.n_required_items} items needed for {round(c.target_power * 100)}% power"
             f" ({c.n_additional_items} more than paired)"
         )
+        if c.power_alpha != c.alpha:
+            # M8/M2: name the level the plan was made at, since the verdict above it
+            # is judged on a corrected p and the two must match.
+            power += f", planned at alpha={c.power_alpha:.4g} for {c.n_comparisons} comparisons"
     lines = [
         f"{c.variant_b} vs {c.variant_a} (diff = {c.variant_b} - {c.variant_a})",
         row("paired items:", f"{c.n_items} ({c.n_items_dropped} dropped)"),
         row(f"mean {c.variant_a}:", _fmt(c.mean_a)),
         row(f"mean {c.variant_b}:", _fmt(c.mean_b)),
         row("mean diff:", _fmt(c.mean_diff)),
-        row(f"{round(c.ci_level * 100)}% CI:", f"[{_fmt(c.ci_low)}, {_fmt(c.ci_high)}]"),
+        row(f"{round(c.ci_level * 100)}% CI:", _ci_text(c)),
         row("p-value:", _p_value_text(c)),
-        row("power:", power),
     ]
+    note = _resolution_note(c)
+    if note is not None:
+        lines.append(row("note:", note))  # qualifies the p-value directly above
+    lines.append(row("power:", power))
     allocation = _allocation_text(c)
     if allocation is not None:
         split, advice = allocation
@@ -205,6 +234,7 @@ def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -
         lines.append(
             f"  {'variance shares:':<18}condition {shares.share_condition:.1%},"
             f" item {shares.share_item:.1%}, noise {shares.share_noise:.1%}"
+            " (raw-score scale)"
         )
     if len(result.comparisons) > 1 and result.correction_method is not None:
         label = _CORRECTION_LABELS.get(result.correction_method, result.correction_method)
@@ -216,6 +246,12 @@ def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -
     for comparison in result.comparisons:
         lines.append("")
         lines.extend(_comparison_lines(comparison))
+    if result.comparisons:
+        lines.append("")
+        lines.append(
+            # ASCII only (cp1252 consoles), and short enough not to wrap at 100.
+            "interval: studentized bootstrap; p-value: sign-flip permutation - they can disagree"
+        )
     return "\n".join(lines)
 
 
@@ -350,20 +386,25 @@ def _comparison_html(c: Comparison) -> str:
             f"{c.n_required_items} items for {round(c.target_power * 100)}% power"
             f" ({c.n_additional_items} more than paired)"
         )
+        if c.power_alpha != c.alpha:
+            power += f", at alpha={c.power_alpha:.4g} for {c.n_comparisons} comparisons"
     rows = [
         (f"mean {_esc(c.variant_a)}", _fmt(c.mean_a)),
         (f"mean {_esc(c.variant_b)}", _fmt(c.mean_b)),
         ("mean diff", _fmt(c.mean_diff)),
-        (f"{round(c.ci_level * 100)}% CI", f"[{_fmt(c.ci_low)}, {_fmt(c.ci_high)}]"),
+        (f"{round(c.ci_level * 100)}% CI", _esc(_ci_text(c))),
         ("p-value", _p_value_text(c, html=True)),
         ("paired items", f"{c.n_items} ({c.n_items_dropped} dropped)"),
         ("power", power),
     ]
+    note = _resolution_note(c)
+    if note is not None:
+        rows.append(("resolution", _esc(note)))
     allocation = _allocation_text(c)
     if allocation is not None:
         v = c.variance
-        rows.append(("variance (item)", f"{v.var_between:.3f}"))
-        rows.append(("variance (sampling)", f"{v.var_within:.3f}"))
+        rows.append(("variance, item (diff scale)", f"{v.var_between:.3f}"))
+        rows.append(("variance, replicate noise (diff scale)", f"{v.var_within:.3f}"))
         rows.append(("samples per item", f"{v.mean_replicates:.1f}"))
         rows.append(("allocation", _esc(allocation[1])))
     cells = "".join(f"<tr><th>{label}</th><td>{value}</td></tr>" for label, value in rows)
@@ -425,7 +466,8 @@ def render_html(
     shares_html = ""
     if shares is not None:
         shares_html = (
-            f'<p class="muted">variance shares: condition {shares.share_condition:.1%},'
+            f'<p class="muted">variance shares (raw-score scale):'
+            f" condition {shares.share_condition:.1%},"
             f" item {shares.share_item:.1%}, noise {shares.share_noise:.1%}</p>"
         )
     family = ""
@@ -435,10 +477,17 @@ def render_html(
             f'<p class="muted">multiple comparisons: {len(result.comparisons)} pairs,'
             f" p-values corrected ({_esc(label)}); CIs are uncorrected</p>"
         )
+    procedures = (
+        '<p class="muted">the interval is a studentized bootstrap and the p-value is a'
+        " sign-flip permutation test — they can disagree</p>"
+        if result.comparisons
+        else ""
+    )
     comparisons = (
         "<section><h2>comparisons</h2>"
         + family
         + "".join(_comparison_html(c) for c in result.comparisons)
+        + procedures
         + "</section>"
     )
     judge = _judge_html(card) if card is not None else ""
