@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="mimir" width="520">
+</p>
+
 # mimir (WIP)
 
 in Norse mythology, Mimir guarded the well of wisdom, Mímisbrunnr, beneath the world tree. Odin gave up an eye for a single drink from it.
