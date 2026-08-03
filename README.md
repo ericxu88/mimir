@@ -14,7 +14,7 @@ mimir is a small harness for running LLM experiments properly. You describe an e
 
 ## install
 
-not on PyPI yet (it will ship as `mimisbrunnr` — plain `mimir` was taken; the CLI and import name stay `mimir`). for now, install from source:
+not on PyPI yet. for now, install from source:
 
 ```sh
 git clone https://github.com/ericxu88/mimir.git
