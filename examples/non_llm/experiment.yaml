@@ -1,0 +1,68 @@
+# A PRE-REGISTERED experiment on a system with no LLM anywhere (M11):
+# two randomized knapsack optimizers compared under mimir's full statistics.
+#
+#   uv run mimir run examples/non_llm/experiment.yaml --db knap.db
+#   uv run mimir analyze <run_id> --db knap.db
+#
+# What to look for:
+# - `mimir run` prints `preregistered: <sha256>` — the hash of the hypothesis,
+#   the analysis plan, and the experimental design (variants, dataset, sampling,
+#   n_samples, judge). Publish it before looking at results; anyone can recompute
+#   it later from the stored run.
+# - `mimir analyze` shows the same hash, whether the analysis was confirmatory,
+#   and tags the pre-registered primary comparison [PRIMARY]. Overriding the
+#   planned correction with --correction relabels everything EXPLORATORY.
+#
+# Mechanics: commands run with cwd = this file's directory; each argv element is
+# rendered per item with {seed} and the item's fields. Outputs are cached by
+# content — re-runs are instant, raising n_samples executes only the delta. The
+# cache cannot see edits to knapsack.py itself: after changing the script, use a
+# fresh --db (or add a version element to `command`). `limits` pace all condition
+# types; the default 60 requests/minute would crawl through 192 local subprocess
+# launches, so raise it for local work.
+name: knapsack-optimizers
+description: restart hill climbing vs simulated annealing, equal evaluation budgets
+
+hypothesis: >
+  At a 500-evaluation budget, simulated annealing finds better knapsack packings
+  than random-restart hill climbing.
+
+analysis_plan:
+  primary: [restart, anneal]    # scored as anneal - restart (declaration order)
+  alpha: 0.05
+  correction: holm
+
+variants:
+  - type: command
+    name: restart
+    command:
+      ["python3", "knapsack.py", "--algo", "restart",
+       "--instance", "{instance}", "--seed", "{seed}"]
+  - type: command
+    name: anneal
+    command:
+      ["python3", "knapsack.py", "--algo", "anneal",
+       "--instance", "{instance}", "--seed", "{seed}"]
+
+dataset:
+  items:
+    - {id: alfa, instance: alfa}
+    - {id: bravo, instance: bravo}
+    - {id: charlie, instance: charlie}
+    - {id: delta, instance: delta}
+    - {id: echo, instance: echo}
+    - {id: foxtrot, instance: foxtrot}
+    - {id: golf, instance: golf}
+    - {id: hotel, instance: hotel}
+
+sampling:
+  seed: 7          # replicate i runs with seed 7+i, shared across both arms (CRN)
+
+n_samples: 12
+
+judge:
+  type: parse_float   # score = final stdout line: 1 + 9*best/optimum, in [1, 10]
+
+limits:
+  concurrency: 8
+  requests_per_minute: 100000

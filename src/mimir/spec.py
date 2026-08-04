@@ -208,6 +208,37 @@ class ParseFloatScorerSpec(BaseModel):
 AnyVariant = Annotated[Variant | CommandVariant | PythonVariant, Field(discriminator="type")]
 AnyJudge = Annotated[Judge | ParseFloatScorerSpec, Field(discriminator="type")]
 
+# v1 analyzes at stats.py's fixed module constant; a cross-module test pins the
+# two literals equal (never import stats here — numpy at spec load, layering).
+_PLAN_ALPHA = 0.05
+
+
+class AnalysisPlan(BaseModel):
+    """Pre-registered analysis plan (M11, DESIGN §14).
+
+    `primary` names THE comparison the hypothesis rides on; `comparisons` are
+    additional planned pairs. Pairs match analysis output as UNORDERED name
+    sets (the report's diff orientation stays declaration-order). The resolved
+    plan is part of the preregistration hash.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    primary: tuple[str, str]
+    comparisons: list[tuple[str, str]] = []
+    alpha: float = _PLAN_ALPHA
+    correction: Literal["holm", "bh"] = "holm"
+
+    @field_validator("alpha")
+    @classmethod
+    def _alpha_is_the_module_constant(cls, value: float) -> float:
+        if value != _PLAN_ALPHA:
+            raise ValueError(
+                f"alpha must be {_PLAN_ALPHA} in v1 — analysis runs at stats.py's fixed"
+                " module constant (DESIGN §7); a configurable alpha is deferred (DESIGN §12)"
+            )
+        return value
+
 
 class Limits(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -226,7 +257,16 @@ class ExperimentSpec(BaseModel):
     sampling: Sampling = Field(default_factory=Sampling)
     n_samples: int = Field(default=1, ge=1)
     judge: AnyJudge | None = None
+    hypothesis: str | None = None
+    analysis_plan: AnalysisPlan | None = None
     limits: Limits = Field(default_factory=Limits)
+
+    @field_validator("hypothesis")
+    @classmethod
+    def _hypothesis_utf8(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _reject_lone_surrogates(value, "hypothesis")
 
     @model_validator(mode="before")
     @classmethod
@@ -264,6 +304,35 @@ class ExperimentSpec(BaseModel):
             )
         if self.sampling.model is None and any(v.type == "llm" for v in self.variants):
             raise ValueError("sampling.model is required when any variant has type 'llm'")
+        if self.hypothesis is not None and self.analysis_plan is None:
+            raise ValueError(
+                "hypothesis requires an analysis_plan — pre-register the analysis,"
+                " not just the claim"
+            )
+        if self.analysis_plan is not None:
+            if self.judge is None:
+                raise ValueError(
+                    "analysis_plan requires a judge/scorer block; a sample-only run"
+                    " produces nothing to analyze"
+                )
+            declared = set(names)
+            seen_pairs: set[frozenset[str]] = set()
+            for a, b in [self.analysis_plan.primary, *self.analysis_plan.comparisons]:
+                if a == b:
+                    raise ValueError(
+                        f"analysis_plan pair ({a!r}, {a!r}) must name two distinct variants"
+                    )
+                unknown = {a, b} - declared
+                if unknown:
+                    raise ValueError(
+                        f"analysis_plan names {sorted(unknown)} are not declared variants"
+                    )
+                key = frozenset((a, b))
+                if key in seen_pairs:
+                    raise ValueError(
+                        f"analysis_plan lists {a!r} vs {b!r} more than once (pairs are unordered)"
+                    )
+                seen_pairs.add(key)
         return self
 
 

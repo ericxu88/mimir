@@ -15,6 +15,7 @@ import math
 from collections.abc import Sequence
 
 from mimir.judge_audit import JudgeReportCard
+from mimir.prereg import PreregReport
 from mimir.stats import AnalysisResult, Comparison
 
 # --- SVG histogram geometry (pinned; tests hand-compute attributes from these) ----
@@ -179,7 +180,40 @@ def _score_axis(mode: str) -> tuple[float, float, int]:
 # --- terminal renderers -----------------------------------------------------------
 
 
-def _comparison_lines(c: Comparison) -> list[str]:
+def _one_line(text: str) -> str:
+    # YAML block scalars put real newlines in hypotheses; the terminal report is
+    # line-oriented, so collapse all whitespace runs to single spaces.
+    return " ".join(text.split())
+
+
+_TAG_BY_LABEL = {"primary": "[PRIMARY]", "planned": "[PLANNED]"}
+
+
+def _comparison_tag(prereg: PreregReport | None, index: int) -> str | None:
+    if prereg is None:
+        return None
+    if not prereg.confirmatory:
+        return "[EXPLORATORY - deviates from plan]"
+    label = prereg.labels[index] if index < len(prereg.labels) else "exploratory"
+    return _TAG_BY_LABEL.get(label, "[EXPLORATORY - not pre-registered]")
+
+
+def _plan_summary(prereg: PreregReport) -> str:
+    a, b = prereg.primary
+    summary = f"primary {a} vs {b}; alpha {prereg.alpha:g}; {prereg.correction} correction"
+    if prereg.planned:
+        plural = "s" if len(prereg.planned) > 1 else ""
+        summary += f"; {len(prereg.planned)} additional planned pair{plural}"
+    return summary
+
+
+def _prereg_status(prereg: PreregReport) -> str:
+    if prereg.confirmatory:
+        return "confirmatory"
+    return "EXPLORATORY: " + "; ".join(prereg.deviations)
+
+
+def _comparison_lines(c: Comparison, tag: str | None = None) -> list[str]:
     def row(label: str, value: str) -> str:
         return f"  {label:<18}{value}"
 
@@ -194,8 +228,11 @@ def _comparison_lines(c: Comparison) -> list[str]:
             # M8/M2: name the level the plan was made at, since the verdict above it
             # is judged on a corrected p and the two must match.
             power += f", planned at alpha={c.power_alpha:.4g} for {c.n_comparisons} comparisons"
+    header = f"{c.variant_b} vs {c.variant_a} (diff = {c.variant_b} - {c.variant_a})"
+    if tag is not None:
+        header += f" {tag}"
     lines = [
-        f"{c.variant_b} vs {c.variant_a} (diff = {c.variant_b} - {c.variant_a})",
+        header,
         row("paired items:", f"{c.n_items} ({c.n_items_dropped} dropped)"),
         row(f"mean {c.variant_a}:", _fmt(c.mean_a)),
         row(f"mean {c.variant_b}:", _fmt(c.mean_b)),
@@ -215,8 +252,13 @@ def _comparison_lines(c: Comparison) -> list[str]:
     return lines
 
 
-def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -> str:
-    """Plain-text analysis report; `status` (from the runs table) is optional."""
+def render_analysis_text(
+    result: AnalysisResult,
+    *,
+    status: str | None = None,
+    prereg: PreregReport | None = None,
+) -> str:
+    """Plain-text analysis report; `status` (runs table) and `prereg` are optional."""
     run_line = f"run: {result.run_id} ({result.mode}"
     run_line += f", status: {status})" if status is not None else ")"
     lines = [
@@ -224,6 +266,14 @@ def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -
         run_line,
         f"items: {result.n_items} | judgments used: {result.n_judgments_used}"
         f" | errored: {result.n_judgments_errored}",
+    ]
+    if prereg is not None:
+        lines.append("")
+        lines.append(f"preregistration: {prereg.prereg_hash} ({_prereg_status(prereg)})")
+        if prereg.hypothesis:
+            lines.append(f"  {'hypothesis:':<18}{_one_line(prereg.hypothesis)}")
+        lines.append(f"  {'plan:':<18}{_plan_summary(prereg)}")
+    lines += [
         "",
         "variants:",
     ]
@@ -249,9 +299,9 @@ def render_analysis_text(result: AnalysisResult, *, status: str | None = None) -
             f"multiple comparisons: {len(result.comparisons)} pairs,"
             f" p-values corrected ({label}); CIs are uncorrected"
         )
-    for comparison in result.comparisons:
+    for index, comparison in enumerate(result.comparisons):
         lines.append("")
-        lines.extend(_comparison_lines(comparison))
+        lines.extend(_comparison_lines(comparison, tag=_comparison_tag(prereg, index)))
     if result.comparisons:
         lines.append("")
         lines.append(
@@ -384,7 +434,21 @@ def _distributions_html(result: AnalysisResult) -> str:
     return "".join(parts)
 
 
-def _comparison_html(c: Comparison) -> str:
+def _prereg_html(prereg: PreregReport) -> str:
+    rows = [
+        (
+            "hash",
+            f"<code>{_esc(prereg.prereg_hash)}</code> ({_esc(_prereg_status(prereg))})",
+        ),
+    ]
+    if prereg.hypothesis:
+        rows.append(("hypothesis", _esc(_one_line(prereg.hypothesis))))
+    rows.append(("plan", _esc(_plan_summary(prereg))))
+    cells = "".join(f"<tr><th>{label}</th><td>{value}</td></tr>" for label, value in rows)
+    return f"<section><h2>preregistration</h2><table>{cells}</table></section>"
+
+
+def _comparison_html(c: Comparison, tag: str | None = None) -> str:
     if c.n_additional_items is None:
         power = "not estimable"
     else:
@@ -418,8 +482,9 @@ def _comparison_html(c: Comparison) -> str:
     p_shown = c.p_value_corrected if corrected else c.p_value
     suffix = f" after {_esc(c.correction_method)} correction" if corrected else ""
     verdict = "yes" if p_shown < c.alpha else "no"
+    tag_bit = f" {_esc(tag)}" if tag is not None else ""
     return (
-        f"<h3>{_esc(c.variant_b)} vs {_esc(c.variant_a)}</h3><table>{cells}</table>"
+        f"<h3>{_esc(c.variant_b)} vs {_esc(c.variant_a)}{tag_bit}</h3><table>{cells}</table>"
         f"<p>significant at alpha={c.alpha:g}{suffix}: {verdict}</p>"
     )
 
@@ -457,6 +522,7 @@ def render_html(
     card: JudgeReportCard | None = None,
     *,
     status: str | None = None,
+    prereg: PreregReport | None = None,
 ) -> str:
     """One self-contained HTML report: inline CSS, inline SVG, no JS, no external refs."""
     status_bit = f" - status {_esc(status)}" if status is not None else ""
@@ -494,18 +560,23 @@ def render_html(
     comparisons = (
         "<section><h2>comparisons</h2>"
         + family
-        + "".join(_comparison_html(c) for c in result.comparisons)
+        + "".join(
+            _comparison_html(c, tag=_comparison_tag(prereg, index))
+            for index, c in enumerate(result.comparisons)
+        )
         + procedures
         + "</section>"
     )
     judge = _judge_html(card) if card is not None else ""
+    prereg_html = _prereg_html(prereg) if prereg is not None else ""
     title = f"mimir report - {_esc(result.experiment_name)} - {_esc(result.run_id)}"
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
         f"<title>{title}</title><style>{_STYLE}</style></head><body><main>"
-        f"{header}{warning}{_summary_html(result)}{shares_html}{_distributions_html(result)}"
+        f"{header}{warning}{_summary_html(result)}{prereg_html}"
+        f"{shares_html}{_distributions_html(result)}"
         f"{comparisons}{judge}"
         "</main></body></html>"
     )

@@ -88,3 +88,41 @@ def test_subprocess_example_runs_and_analyzes_keyless(tmp_path, monkeypatch, cap
     assert "fast" in out
     assert "slow" in out
     assert "95% CI" in out
+
+
+# --- M11: the pre-registered non-LLM example ---------------------------------------
+
+
+def test_non_llm_example_validates():
+    spec = load_spec(EXAMPLES / "non_llm" / "experiment.yaml")
+    items = load_items(spec, EXAMPLES / "non_llm")
+    assert len(items) == 8  # sign-flip floor 2/2^8 < 0.05: the design CAN reject
+    assert all(variant.type == "command" for variant in spec.variants)
+    assert spec.judge.type == "parse_float"
+    assert spec.hypothesis is not None
+    assert spec.analysis_plan.primary == ("restart", "anneal")
+    assert spec.analysis_plan.correction == "holm"
+
+
+def test_non_llm_example_runs_preregistered_end_to_end(tmp_path, monkeypatch, capsys):
+    # The full M11 story, keyless: run prints the commitment hash; analyze shows
+    # the same hash, confirmatory status, and the [PRIMARY] tag. Assertions are
+    # structural — algorithm quality numbers live in the tuning, not in tests.
+    import re
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db = tmp_path / "knap.db"
+    assert main(["run", str(EXAMPLES / "non_llm" / "experiment.yaml"), "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "samples: 192 (0 errors)" in captured.out  # 2 arms x 8 instances x 12
+    assert "judgments: 192 (0 errors)" in captured.out
+    assert captured.err == ""
+    run_id = re.search(r"run (\S+) complete", captured.out).group(1)
+    run_hash = re.search(r"preregistered: ([0-9a-f]{64})", captured.out).group(1)
+
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert f"preregistration: {run_hash} (confirmatory)" in captured.out
+    assert "[PRIMARY]" in captured.out
+    assert "cannot reach significance" not in captured.out
+    assert captured.err == ""

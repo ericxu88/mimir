@@ -644,3 +644,146 @@ def test_llm_judge_over_command_variants_validates(tmp_path):
     spec = ExperimentSpec.model_validate(data)
     assert spec.judge.type == "llm"
     assert load_items(spec, tmp_path)
+
+
+# --- M11: pre-registration (hypothesis + analysis_plan) ----------------------------
+
+
+def planned_spec_dict(**overrides):
+    data = spec_dict(judge={"model": "j", "mode": "pairwise"})
+    data["hypothesis"] = "friendly beats control on judged quality"
+    data["analysis_plan"] = {"primary": ["control", "friendly"]}
+    data.update(overrides)
+    return data
+
+
+def multiarm_planned_dict():
+    data = spec_dict(judge={"model": "j", "mode": "rubric"})
+    data["variants"].append(
+        {"name": "third", "system": "", "user_template": "Answer the question: {input}"}
+    )
+    data["analysis_plan"] = {"primary": ["control", "friendly"]}
+    return data
+
+
+def test_analysis_plan_minimal_resolves_defaults():
+    spec = ExperimentSpec.model_validate(planned_spec_dict())
+    plan = spec.analysis_plan
+    assert plan.primary == ("control", "friendly")
+    assert plan.comparisons == []
+    assert plan.alpha == 0.05
+    assert plan.correction == "holm"
+    assert spec.hypothesis.startswith("friendly")
+
+
+def test_plan_without_hypothesis_is_fine():
+    data = planned_spec_dict()
+    del data["hypothesis"]
+    spec = ExperimentSpec.model_validate(data)
+    assert spec.hypothesis is None
+    assert spec.analysis_plan is not None
+
+
+def test_hypothesis_without_plan_rejected():
+    # No silent ignore: a claim without a pre-registered analysis is not prereg.
+    data = spec_dict(judge={"model": "j", "mode": "pairwise"})
+    data["hypothesis"] = "something"
+    with pytest.raises(ValidationError, match="analysis_plan"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_plan_without_judge_rejected():
+    data = spec_dict()
+    data["analysis_plan"] = {"primary": ["control", "friendly"]}
+    with pytest.raises(ValidationError, match="judge"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_plan_valid_with_parse_float_scorer():
+    data = command_spec_dict()
+    data["hypothesis"] = "fast beats slow"
+    data["analysis_plan"] = {"primary": ["fast", "slow"]}
+    spec = ExperimentSpec.model_validate(data)
+    assert spec.analysis_plan.primary == ("fast", "slow")
+
+
+def test_plan_names_must_be_declared_variants():
+    data = planned_spec_dict()
+    data["analysis_plan"] = {"primary": ["control", "nope"]}
+    with pytest.raises(ValidationError, match="nope"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_plan_self_pair_rejected():
+    data = planned_spec_dict()
+    data["analysis_plan"] = {"primary": ["control", "control"]}
+    with pytest.raises(ValidationError, match="distinct"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_plan_duplicate_unordered_pairs_rejected():
+    data = multiarm_planned_dict()
+    data["analysis_plan"] = {
+        "primary": ["control", "friendly"],
+        "comparisons": [["friendly", "control"]],
+    }
+    with pytest.raises(ValidationError, match="once"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_pairwise_plan_cannot_add_planned_comparisons():
+    # 2 variants: any extra pair either repeats the primary (reversed or not) or
+    # names an unknown variant — the generic rules close every door.
+    data = planned_spec_dict()
+    data["analysis_plan"] = {
+        "primary": ["control", "friendly"],
+        "comparisons": [["friendly", "control"]],
+    }
+    with pytest.raises(ValidationError, match="once"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_plan_extra_comparisons_accepted_multiarm():
+    data = multiarm_planned_dict()
+    data["analysis_plan"] = {
+        "primary": ["control", "friendly"],
+        "comparisons": [["control", "third"]],
+    }
+    spec = ExperimentSpec.model_validate(data)
+    assert spec.analysis_plan.comparisons == [("control", "third")]
+
+
+def test_plan_alpha_other_than_module_constant_rejected():
+    data = planned_spec_dict()
+    data["analysis_plan"] = {"primary": ["control", "friendly"], "alpha": 0.01}
+    with pytest.raises(ValidationError, match=r"0\.05"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_plan_explicit_default_alpha_accepted():
+    data = planned_spec_dict()
+    data["analysis_plan"] = {"primary": ["control", "friendly"], "alpha": 0.05}
+    assert ExperimentSpec.model_validate(data).analysis_plan.alpha == 0.05
+
+
+def test_plan_unknown_correction_rejected():
+    data = planned_spec_dict()
+    data["analysis_plan"] = {"primary": ["control", "friendly"], "correction": "bonferroni"}
+    with pytest.raises(ValidationError):
+        ExperimentSpec.model_validate(data)
+
+
+def test_hypothesis_rejects_lone_surrogate():
+    data = planned_spec_dict(hypothesis="bad \ud800 hypothesis")
+    with pytest.raises(ValidationError, match="lone surrogate"):
+        ExperimentSpec.model_validate(data)
+
+
+def test_planned_spec_dump_round_trips_through_json():
+    # The spec_json path: model_dump -> json -> re-validate must preserve the plan.
+    spec = ExperimentSpec.model_validate(planned_spec_dict())
+    dumped = spec.model_dump()
+    assert dumped["analysis_plan"]["primary"] == ("control", "friendly")
+    again = ExperimentSpec.model_validate(json.loads(json.dumps(dumped)))
+    assert again.analysis_plan == spec.analysis_plan
+    assert again.hypothesis == spec.hypothesis

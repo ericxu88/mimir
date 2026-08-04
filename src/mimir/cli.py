@@ -15,6 +15,7 @@ at all — they run keyless and offline, and `--mock` is a silent no-op.
 
 import argparse
 import asyncio
+import json
 import re
 import sqlite3
 import sys
@@ -28,6 +29,7 @@ from mimir.clients.base import Client
 from mimir.clients.mock import MockClient
 from mimir.conditions import needs_client
 from mimir.judge_audit import audit_judge
+from mimir.prereg import evaluate_prereg, prereg_hash
 from mimir.report import render_analysis_text, render_audit_text, render_html
 from mimir.runner import run_experiment
 from mimir.spec import load_spec
@@ -106,6 +108,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         f"samples: {len(samples)} ({sample_errors} errors)"
         f" | judgments: {len(judgments)} ({judgment_errors} errors)"
     )
+    if spec.analysis_plan is not None:
+        # The commitment device (DESIGN §14): the hash of the pre-registered
+        # content, printed at run time and recomputable forever from spec_json.
+        # Last line, so run-id extraction from the first line stays stable.
+        print(f"preregistered: {prereg_hash(spec.model_dump())}")
     return 0 if status == "complete" else 1
 
 
@@ -121,8 +128,33 @@ def _html_path(args: argparse.Namespace, run_id: str) -> Path:
 def _cmd_analyze(args: argparse.Namespace) -> int:
     try:
         with _open_store(args.db) as store:
-            result = analyze_run(store, args.run_id, correction=args.correction)
-            status = store.get_run(args.run_id)["status"]
+            # Fetched BEFORE analyze_run so the pre-registered correction can be
+            # the default; when the run is missing, skip resolution entirely and
+            # let analyze_run raise its own "not found" (never dereference None).
+            run = store.get_run(args.run_id)
+            spec_dump = json.loads(run["spec_json"]) if run is not None else {}
+            plan_dict = spec_dump.get("analysis_plan")
+            correction = args.correction
+            if correction is None:
+                correction = (
+                    plan_dict.get("correction", DEFAULT_CORRECTION)
+                    if isinstance(plan_dict, dict)
+                    else DEFAULT_CORRECTION
+                )
+            result = analyze_run(store, args.run_id, correction=correction)
+            status = run["status"]  # analyze_run succeeded, so the run row exists
+            prereg = None
+            if plan_dict is not None:
+                try:
+                    prereg = evaluate_prereg(spec_dump, result)
+                except ValueError:
+                    # Hand-edited spec_json: metadata must never kill a valid
+                    # analysis — render without the preregistration section.
+                    print(
+                        f"warning: run {args.run_id} has an invalid stored"
+                        " analysis_plan; rendering without preregistration",
+                        file=sys.stderr,
+                    )
             card = None
             if args.html is not None:
                 # Defensive: analyze succeeding implies a judged run, but the audit
@@ -136,11 +168,13 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
     except sqlite3.Error as exc:
         return _fail(f"database error: {exc}")
     _warn_on_status(status, args.run_id)
-    print(render_analysis_text(result, status=status))
+    print(render_analysis_text(result, status=status, prereg=prereg))
     if args.html is not None:
         path = _html_path(args, args.run_id)
         try:
-            path.write_text(render_html(result, card, status=status), encoding="utf-8")
+            path.write_text(
+                render_html(result, card, status=status, prereg=prereg), encoding="utf-8"
+            )
         except OSError as exc:
             return _fail(f"cannot write {path}: {exc}")
         print(f"wrote {path}")
@@ -164,7 +198,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 def _build_parser() -> argparse.ArgumentParser:
     # prog is pinned: under pytest, sys.argv[0] is the pytest binary.
     parser = argparse.ArgumentParser(
-        prog="mimir", description="statistically rigorous LLM experiments"
+        prog="mimir", description="statistically rigorous experiments on stochastic systems"
     )
     parser.add_argument("-V", "--version", action="version", version=f"mimir {__version__}")
     sub = parser.add_subparsers(dest="command")  # not required: bare call prints version
@@ -185,9 +219,10 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze_p.add_argument(
         "--correction",
         choices=CORRECTION_METHODS,
-        default=DEFAULT_CORRECTION,
+        default=None,
         help="multiple-comparison correction across the run's variant pairs"
-        " (default: %(default)s; no effect on a 2-variant run)",
+        " (default: the spec's pre-registered choice, else holm; no effect on"
+        " a 2-variant run)",
     )
     analyze_p.add_argument(
         "--html",

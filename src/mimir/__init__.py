@@ -1,4 +1,4 @@
-"""Mimir: statistically rigorous LLM experiment harness."""
+"""Mimir: statistically rigorous experiment harness for stochastic systems."""
 
 from importlib.metadata import version
 

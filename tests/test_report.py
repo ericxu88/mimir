@@ -604,3 +604,124 @@ def test_html_judge_card_labels_disambiguated_from_summary():
     assert "<th>judgments used (audit)</th>" in out
     assert "<th>judgments errored (audit)</th>" in out
     assert out.count("<th>judgments used</th>") == 1  # the stats summary header only
+
+
+# --- M11: preregistration rendering ------------------------------------------------
+
+
+from mimir.prereg import PreregReport  # noqa: E402  (M11 section import, append-only file)
+
+
+def make_prereg(**overrides):
+    fields = {
+        "prereg_hash": "ab" * 32,
+        "hypothesis": "friendly beats control",
+        "primary": ("control", "friendly"),
+        "planned": (),
+        "alpha": 0.05,
+        "correction": "holm",
+        "confirmatory": True,
+        "deviations": (),
+        "labels": ("primary",),
+    }
+    fields.update(overrides)
+    return PreregReport(**fields)
+
+
+def test_render_analysis_text_prereg_confirmatory_block():
+    text = render_analysis_text(make_result(), prereg=make_prereg())
+    lines = text.splitlines()
+    prereg_line = f"preregistration: {'ab' * 32} (confirmatory)"
+    assert prereg_line in lines
+    # Placed between the header block and the variants block.
+    assert lines.index(prereg_line) < lines.index("variants:")
+    assert lines.index(prereg_line) > lines.index(
+        "items: 4 | judgments used: 16 | errored: 0"
+    )
+    assert any(line.startswith("  hypothesis:") for line in lines)
+    plan_lines = [line for line in lines if line.startswith("  plan:")]
+    assert len(plan_lines) == 1
+    assert "primary control vs friendly" in plan_lines[0]
+    assert "alpha 0.05" in plan_lines[0]
+    assert "holm correction" in plan_lines[0]
+    assert text.rstrip().splitlines()[-1].startswith("interval:")  # trailer intact
+
+
+def test_render_analysis_text_prereg_primary_tag_on_comparison_header():
+    text = render_analysis_text(make_result(), prereg=make_prereg())
+    assert "friendly vs control (diff = friendly - control) [PRIMARY]" in text
+
+
+def test_render_analysis_text_prereg_hypothesis_collapsed_to_one_line():
+    prereg = make_prereg(hypothesis="friendly\nbeats   control\n\non quality")
+    text = render_analysis_text(make_result(), prereg=prereg)
+    assert "  hypothesis:       friendly beats control on quality" in text.splitlines()
+
+
+def test_render_analysis_text_prereg_deviation_marks_everything_exploratory():
+    prereg = make_prereg(
+        confirmatory=False,
+        deviations=("correction 'bh' differs from the planned 'holm'",),
+        labels=("exploratory",),
+    )
+    text = render_analysis_text(make_result(), prereg=prereg)
+    assert (
+        f"preregistration: {'ab' * 32}"
+        " (EXPLORATORY: correction 'bh' differs from the planned 'holm')"
+    ) in text
+    assert "[EXPLORATORY - deviates from plan]" in text
+    assert "[PRIMARY]" not in text
+
+
+def test_render_analysis_text_prereg_multiarm_tags():
+    comparisons = [
+        make_comparison(),
+        make_comparison(variant_a="control", variant_b="third"),
+        make_comparison(variant_a="friendly", variant_b="third"),
+    ]
+    result = make_result(comparisons=comparisons, correction_method="holm")
+    prereg = make_prereg(
+        planned=(("control", "third"),),
+        labels=("primary", "planned", "exploratory"),
+    )
+    text = render_analysis_text(result, prereg=prereg)
+    assert "friendly vs control (diff = friendly - control) [PRIMARY]" in text
+    assert "third vs control (diff = third - control) [PLANNED]" in text
+    assert "third vs friendly (diff = third - friendly) [EXPLORATORY - not pre-registered]" in text
+    plan_lines = [line for line in text.splitlines() if line.startswith("  plan:")]
+    assert "1 additional planned pair" in plan_lines[0]
+
+
+def test_render_analysis_text_without_prereg_has_no_prereg_output():
+    assert "preregistration" not in render_analysis_text(make_result())
+    assert "[PRIMARY]" not in render_analysis_text(make_result())
+
+
+def test_render_html_prereg_section_and_tags():
+    html_out = render_html(make_result(), None, prereg=make_prereg())
+    assert "ab" * 32 in html_out
+    assert "(confirmatory)" in html_out
+    assert "[PRIMARY]" in html_out
+    assert html_out.count("<figure") == 2  # prereg adds a table, never a figure
+
+
+def test_render_html_prereg_escapes_hypothesis():
+    prereg = make_prereg(hypothesis="<b>bold</b> claim & more")
+    html_out = render_html(make_result(), None, prereg=prereg)
+    assert "<b>bold</b>" not in html_out
+    assert "&lt;b&gt;bold&lt;/b&gt; claim &amp; more" in html_out
+
+
+def test_render_html_prereg_deviation_status():
+    prereg = make_prereg(
+        confirmatory=False,
+        deviations=("correction 'bh' differs from the planned 'holm'",),
+        labels=("exploratory",),
+    )
+    html_out = render_html(make_result(), None, prereg=prereg)
+    assert "EXPLORATORY" in html_out
+    assert "[EXPLORATORY - deviates from plan]" in html_out
+
+
+def test_render_html_without_prereg_has_no_prereg_section():
+    assert "preregistration" not in render_html(make_result(), None)

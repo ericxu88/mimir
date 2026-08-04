@@ -559,3 +559,133 @@ def test_audit_judge_parse_float_run_errors_cleanly(tmp_path, monkeypatch, capsy
     captured = capsys.readouterr()
     assert "error:" in captured.err
     assert re.search(r"mode|model", captured.err)
+
+
+# --- M11: preregistration through the CLI ------------------------------------------
+
+
+def planned_command_spec_yaml(tmp_path, *, three_arms=False, plan_correction="holm"):
+    code = "import sys; print(float(sys.argv[1]) + int(sys.argv[2]) / 10)"
+
+    def arm(name, base):
+        return {
+            "type": "command",
+            "name": name,
+            "command": [sys.executable, "-c", code, str(base), "{seed}"],
+        }
+
+    variants = [arm("fast", 5.0), arm("slow", 2.0)]
+    if three_arms:
+        variants.append(arm("mid", 3.5))
+    spec = {
+        "name": "bench-prereg",
+        "variants": variants,
+        "dataset": {"items": [{"id": "q1", "input": "a"}, {"id": "q2", "input": "b"}]},
+        "judge": {"type": "parse_float"},
+        "hypothesis": "fast beats slow on the benchmark score",
+        "analysis_plan": {"primary": ["fast", "slow"], "correction": plan_correction},
+        "limits": {"concurrency": 4, "requests_per_minute": 100_000},
+    }
+    path = tmp_path / "planned.yaml"
+    path.write_text(yaml.safe_dump(spec), encoding="utf-8")
+    return path
+
+
+def run_planned(tmp_path, capsys, **kwargs):
+    spec_path = planned_command_spec_yaml(tmp_path, **kwargs)
+    db = tmp_path / "results.db"
+    assert main(["run", str(spec_path), "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    run_id = re.search(r"run (\S+) complete", out).group(1)
+    return db, run_id, out
+
+
+def test_run_planned_spec_prints_prereg_hash_last(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = planned_command_spec_yaml(tmp_path)
+    db = tmp_path / "results.db"
+    assert main(["run", str(spec_path), "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    lines = captured.out.rstrip().splitlines()
+    # Last line, so `out.split()[1]`-style run-id extraction stays valid.
+    assert re.fullmatch(r"preregistered: [0-9a-f]{64}", lines[-1])
+    assert lines[0].startswith("run ")
+    assert captured.err == ""
+
+
+def test_analyze_planned_run_shows_confirmatory_prereg(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db, run_id, run_out = run_planned(tmp_path, capsys)
+    run_hash = re.search(r"preregistered: ([0-9a-f]{64})", run_out).group(1)
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert f"preregistration: {run_hash} (confirmatory)" in captured.out
+    assert "hypothesis:" in captured.out
+    assert "[PRIMARY]" in captured.out
+    assert captured.err == ""
+
+
+def test_analyze_uses_planned_correction_by_default(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db, run_id, _ = run_planned(tmp_path, capsys, three_arms=True, plan_correction="bh")
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "bh-corrected" in captured.out  # the plan's choice, no flag passed
+    assert "(confirmatory)" in captured.out
+    assert "[EXPLORATORY - not pre-registered]" in captured.out  # unplanned pairs
+
+
+def test_analyze_explicit_flag_against_plan_deviates_at_m3(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db, run_id, _ = run_planned(tmp_path, capsys, three_arms=True, plan_correction="holm")
+    assert main(["analyze", run_id, "--db", str(db), "--correction", "bh"]) == 0
+    captured = capsys.readouterr()
+    assert "EXPLORATORY:" in captured.out
+    assert "[EXPLORATORY - deviates from plan]" in captured.out
+    assert "[PRIMARY]" not in captured.out
+
+
+def test_analyze_explicit_flag_at_m1_stays_confirmatory(tmp_path, monkeypatch, capsys):
+    # Holm and BH are identical for a single comparison (human-approved m=1 rule).
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db, run_id, _ = run_planned(tmp_path, capsys)
+    assert main(["analyze", run_id, "--db", str(db), "--correction", "bh"]) == 0
+    captured = capsys.readouterr()
+    assert "(confirmatory)" in captured.out
+    assert "[PRIMARY]" in captured.out
+
+
+def test_analyze_garbage_stored_plan_warns_and_renders_without_prereg(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    db, run_id, _ = run_planned(tmp_path, capsys)
+    with sqlite3.connect(db) as connection:
+        row = connection.execute(
+            "SELECT spec_json FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        spec_json = json.loads(row[0])
+        spec_json["analysis_plan"]["alpha"] = 0.5  # invalid: v1 pins alpha
+        connection.execute(
+            "UPDATE runs SET spec_json = ? WHERE id = ?",
+            (json.dumps(spec_json), run_id),
+        )
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "preregistration" not in captured.out
+    assert "warning" in captured.err
+    assert "analysis_plan" in captured.err
+
+
+def test_analyze_planless_run_has_no_prereg_output(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    spec_path = command_spec_yaml(tmp_path, judge={"type": "parse_float"})
+    db = tmp_path / "results.db"
+    assert main(["run", str(spec_path), "--db", str(db)]) == 0
+    out = capsys.readouterr().out
+    assert "preregistered" not in out
+    run_id = re.search(r"run (\S+) complete", out).group(1)
+    assert main(["analyze", run_id, "--db", str(db)]) == 0
+    captured = capsys.readouterr()
+    assert "preregistration" not in captured.out
+    assert captured.err == ""
